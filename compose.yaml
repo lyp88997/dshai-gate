@@ -33,7 +33,7 @@ services:
 
   gate:
     build: ./gate
-    image: dsh-gate:1.3.2
+    image: dsh-gate:1.4.0
     container_name: dshai-gate
     restart: on-failure:5
     network_mode: host

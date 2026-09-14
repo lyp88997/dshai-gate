@@ -540,6 +540,29 @@ func withGate(next http.Handler) http.Handler {
 	})
 }
 
+// loopbackOnlyPrefixes 列出「仅回环同源」类插件接口的前缀。
+// 这些插件把接口围栏为 loopback-only：Host 必须是 127.0.0.1/localhost 且
+// Origin 与之相等，DSH 的 --trusted-host 对这类围栏不生效，于是经反代访问
+// 时一律被拒（任务看板 403、技能中心 400、用量统计/modlens/modsearch 403）。
+// 经门禁（已完成鉴权）转发时向上游补上回环身份即可放行。
+// 将来遇到同类插件，把它的接口前缀加到这里。
+var loopbackOnlyPrefixes = []string{
+	"/api/task-board/",
+	"/api/dsh-skill-explorer/",
+	"/api/dsh-provider-usage/",
+	"/modlens/",
+	"/modsearch/",
+}
+
+func loopbackOnlyPath(path string) bool {
+	for _, prefix := range loopbackOnlyPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------- 反代 ----------
 
 func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
@@ -549,6 +572,15 @@ func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
 			// ★ 关键：SetURL 会把 Host 改成上游地址，必须改回原域名，
 			//   否则 DSH 的 --trusted-host 校验失败，特权接口全部 403
 			pr.Out.Host = pr.In.Host
+			// ★ 仅回环类接口：向上游呈现回环身份（Host + Origin 同步），
+			//   否则插件自身的 loopback-only 围栏会拒绝经反代来的合法请求。
+			//   其余路径一律保持原 Host，避免影响 DSH 的 Cookie 归属与信任校验。
+			if loopbackOnlyPath(pr.In.URL.Path) {
+				pr.Out.Host = target.Host
+				if pr.In.Header.Get("Origin") != "" {
+					pr.Out.Header.Set("Origin", "http://"+target.Host)
+				}
+			}
 			pr.SetXForwarded()
 			// ★ 必须禁用上游压缩，否则响应体是 gzip，注入静默失效
 			pr.Out.Header.Set("Accept-Encoding", "identity")

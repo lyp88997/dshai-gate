@@ -11,7 +11,7 @@
 [![go](https://img.shields.io/badge/Go-1.23%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![deps](https://img.shields.io/badge/dependencies-0-brightgreen)](gate/main.go)
 
-把**只肯监听回环**的 DSH，安全地接到公网 —— 顺便把远端访问会踩的四个坑一次填平。
+把**只肯监听回环**的 DSH，安全地接到公网 —— 顺便把远端访问会踩的五个坑一次填平。
 
 <img src="docs/login.png" width="820" alt="dshai-gate 登录页：动态验证码 + DSH 令牌">
 
@@ -45,14 +45,15 @@ error: --host 0.0.0.0 is intentionally not supported yet for safety:
 ```
 
 所以远端访问 = **DSH 只监听 127.0.0.1** + **前面加一层反向代理**。
-而把 DSH 放到反代后面，会接连撞上四个坑 —— 本项目就是为它们而写：
+而把 DSH 放到反代后面，会接连撞上五个坑 —— 本项目就是为它们而写：
 
 | # | 现象 | 根因 | 本项目的处理 |
 | :-: | --- | --- | --- |
-| 1 | 设置 / 插件 / 凭据等接口返回 **403** | DSH 用 Host/Origin 做特权接口围栏（`isTrustedApiRequest`） | **原样透传 Host**，配合官方 `--trusted-host <域名>`。不伪造 Host/Origin —— 伪造会连带引出 Cookie 归属错乱与重定向死循环 |
+| 1 | 设置 / 插件 / 凭据等接口返回 **403** | DSH 用 Host/Origin 做特权接口围栏（`isTrustedApiRequest`） | **原样透传 Host**，配合官方 `--trusted-host <域名>`。全局改写 Host 会引出 Cookie 归属错乱与重定向死循环，故默认不动它（唯一例外见第 5 行） |
 | 2 | 设置改完**存不住** | 前端按 `location.hostname` 判断"是否本机"，远端被判为非本机，面板退化为内存模式 | 对 `text/html` 注入一行 `window.__DSH_TRANSPORT__={ownsHost:true}` |
 | 3 | 长连接**每分钟断开** | nginx 默认 `proxy_read_timeout 60s` 会切断 SSE / WebSocket | 反代设 `proxy_buffering off` + `proxy_read_timeout 3600s`；本服务对 `text/event-stream` 补 `X-Accel-Buffering: no` |
 | 4 | 裸反代**没有门禁**，扫描器可白嫖模型额度 | 反代本身不做身份校验 | 内置 TOTP 身份门禁 + 四层防爆破 |
+| 5 | 任务看板 / 技能中心 / 用量统计等**插件接口 403、400** | 这几个插件把接口**自己**围栏成 loopback-only（要求 `Host` 必须是 `127.0.0.1` / `localhost`）—— `--trusted-host` 是 DSH 的放行名单，管不到插件**自己**这道围栏 | 只对这些前缀**定向呈现回环身份**（`loopbackOnlyPrefixes`，Host 与 Origin 同步改写），其余路径一律保持原样 |
 
 ## 架构
 
@@ -65,7 +66,7 @@ error: --host 0.0.0.0 is intentionally not supported yet for safety:
    └──────────────┬─────────────┘
                   │ http  127.0.0.1:2299
    ┌──────────────▼─────────────┐
-   │        dshai-gate          │   ← 本项目：门禁 · Host 透传 · 注入
+   │        dshai-gate          │   ← 本项目：门禁 · Host 透传 · 定向回环 · 注入
    └──────────────┬─────────────┘
                   │ http  127.0.0.1:3082
    ┌──────────────▼─────────────┐
@@ -184,6 +185,7 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 | 设置面板能打开但**改完不保留** | 上游把 HTML 压缩了，注入没生效 | 本服务已对上游请求 `Accept-Encoding: identity`；若自行改造反代，务必保留这一点 |
 | 日志里每分钟一条 `upstream timed out` | 反代没设 `proxy_read_timeout` | 按[第 3 步](#3-反向代理只需要最普通的这几行)补齐 |
 | 特权接口 403 | 忘了 `--trusted-host`，或中间层改写了 Host | 让反代 **原样透传 Host**，并把域名加进 `--trusted-host` |
+| 插件面板接口 **403 / 400**（任务看板、技能中心、用量统计…） | 该插件把接口围栏成 loopback-only，而 `--trusted-host` 管不到插件自己的围栏 | 把它的接口前缀加进 `gate/main.go` 的 `loopbackOnlyPrefixes`，重建后用 `scripts/gate-probe.sh` 回归 |
 | DSH 容器反复重启 | 数据目录里有容器读不到的条目（文件监听会抛 EACCES） | 起容器前跑 `scripts/perm-guard.sh`，并把备份**放在数据目录之外** |
 | 改了凭据后不生效 | 配置改动需要重启本服务 | `docker compose up -d gate`（会话密钥不变则已登录设备不受影响） |
 | 把自己锁在门外 | 忘了动态码 / 丢了手机 | 在**服务器上**重跑 `scripts/set-totp.sh` 换新密钥 |
@@ -193,6 +195,7 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 | 脚本 | 用途 |
 | --- | --- |
 | `scripts/selfcheck.sh` | 一键自检：容器健康、门禁是否拦住未授权、登录页是否正确、开放路由是否被挡、旧实例状态 |
+| `scripts/gate-probe.sh` | **门禁链路探针**：自签会话走完整链路，逐项验证插件接口 200、核心接口未受影响、未登录仍是 401（**改过 `loopbackOnlyPrefixes` 后必跑**） |
 | `scripts/perm-guard.sh` | **起容器前必跑**：检查数据目录里有没有容器读不到的条目（否则 DSH 崩溃重启） |
 | `scripts/set-password.sh` | 设置 / 更换口令 |
 | `scripts/set-totp.sh` | 生成 TOTP 密钥；**先验证一次再写配置**，避免把自己锁在门外 |
@@ -204,7 +207,7 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 - **fail-closed**：没有任何认证配置时**拒绝启动**（宁可 502，也不留一扇没锁的门）
 - **只绑回环**：`GATE_LISTEN` 默认 `127.0.0.1`，不要改成 `0.0.0.0`
 - **密钥只从环境变量注入**：仓库与镜像里不含任何凭据；`.gitignore` 也挡掉了 `.env`、初始口令文件、数据目录
-- **不伪造请求头**：Host / Origin / Sec-Fetch-* 一律原样透传，因此不存在 Cookie 归属漂移与重定向死循环
+- **不伪造请求头**：Host / Origin / Sec-Fetch-* **默认**一律原样透传，因此不存在 Cookie 归属漂移与重定向死循环。唯一例外是 `loopbackOnlyPrefixes` 列出的插件接口 —— 它们只认回环身份，而那些都是纯 API 请求，不涉及页面 Cookie 的归属
 - **不做多余的事**：不实现用户系统、不做 OAuth、不引入数据库 —— 一台机器一个人，够用即可
 
 ## 许可与致谢
@@ -215,6 +218,6 @@ MIT © 2026 lyp88997
 [yuexps/deepseek.harness.fnos](https://github.com/yuexps/deepseek.harness.fnos) 的
 `REVERSE_PROXY_ADAPTATION.md`。
 
-本仓库代码为**独立重写**：不含 fnOS 网关的子路径适配、不伪造 Host/Origin、
+本仓库代码为**独立重写**：不含 fnOS 网关的子路径适配、不伪造 Host/Origin（仅对 loopback-only 插件接口定向呈现回环身份）、
 不含自动换票的防环逻辑（改用官方 `--trusted-host` + 一次性配对），
 因此代码量约为其反代部分的 1/6。
