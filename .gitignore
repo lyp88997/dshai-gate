@@ -1,0 +1,9 @@
+# 永远不要提交这些
+.env
+.gate-password-initial
+data/
+workspaces/
+home/
+*.bak-*
+*.tgz
+*.log

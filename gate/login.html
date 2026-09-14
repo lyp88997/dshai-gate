@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{.Title}}</title>
+<style>
+:root{
+  --bg1:#0b1020; --bg2:#141b36; --card:rgba(255,255,255,.075); --cardb:rgba(255,255,255,.16);
+  --fg:#eef2ff; --muted:#a5b0d4; --accent:#6d8bff; --accent2:#9b6dff; --err:#ff8098; --lock:#ffb547;
+  --shadow:0 24px 70px rgba(0,0,0,.5);
+}
+@media (prefers-color-scheme: light){
+  :root{ --bg1:#eef1f8; --bg2:#dde5f6; --card:rgba(255,255,255,.72); --cardb:rgba(255,255,255,.95);
+         --fg:#161d33; --muted:#5b6689; --accent:#3f5bd6; --accent2:#7a4fd6; --err:#d3304f; --lock:#b06a00;
+         --shadow:0 20px 55px rgba(30,45,90,.20); }
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;display:grid;place-items:center;padding:24px;color:var(--fg);
+  font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Roboto,sans-serif;
+  background:
+    radial-gradient(900px 520px at 12% 8%, rgba(109,139,255,.38), transparent 62%),
+    radial-gradient(760px 520px at 88% 88%, rgba(155,109,255,.32), transparent 62%),
+    linear-gradient(160deg,var(--bg1),var(--bg2));
+  background-attachment:fixed;
+}
+.card{
+  width:100%;max-width:400px;padding:34px 30px 26px;border-radius:20px;
+  background:var(--card);border:1px solid var(--cardb);
+  -webkit-backdrop-filter:blur(18px) saturate(150%);backdrop-filter:blur(18px) saturate(150%);
+  box-shadow:var(--shadow);animation:in .5s cubic-bezier(.2,.8,.2,1) both;
+}
+@keyframes in{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:none}}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:22px}
+.dot{width:11px;height:11px;border-radius:50%;flex:0 0 auto;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 0 0 5px rgba(109,139,255,.16)}
+.brand h1{font-size:17px;margin:0;letter-spacing:.3px}
+.brand small{display:block;color:var(--muted);font-weight:400;font-size:12px;margin-top:3px}
+label{display:block;font-size:12.5px;color:var(--muted);margin:0 0 8px}
+label+label, .field+.field{margin-top:14px}
+.field{position:relative}
+input[type=password],input[type=text]{
+  width:100%;padding:13px 52px 13px 14px;border-radius:12px;font-size:15px;color:var(--fg);
+  background:rgba(255,255,255,.07);border:1px solid var(--cardb);outline:none;
+  transition:border-color .15s, box-shadow .15s;
+}
+@media (prefers-color-scheme: light){ input[type=password],input[type=text]{background:rgba(255,255,255,.85)} }
+input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(109,139,255,.18)}
+input:disabled{opacity:.6}
+input#otp{letter-spacing:.42em;font-size:20px;font-weight:600;text-align:center;padding-right:14px;
+  font-variant-numeric:tabular-nums}
+.eye{position:absolute;right:8px;top:50%;transform:translateY(-50%);border:0;background:none;
+  color:var(--muted);cursor:pointer;padding:8px 9px;border-radius:9px;font-size:12px}
+.eye:hover{background:rgba(125,145,255,.14);color:var(--fg)}
+button.go{width:100%;margin-top:18px;padding:13px;border:0;border-radius:12px;cursor:pointer;
+  font-size:15px;font-weight:600;color:#fff;letter-spacing:.3px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  transition:transform .12s, filter .15s, box-shadow .15s}
+button.go:hover:not(:disabled){filter:brightness(1.08);box-shadow:0 10px 26px rgba(109,139,255,.35)}
+button.go:active:not(:disabled){transform:translateY(1px)}
+button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
+.msg{margin-top:14px;font-size:13px;min-height:18px;color:var(--muted)}
+.msg.err{color:var(--err)}
+.msg.lock{color:var(--lock)}
+.shake{animation:sh .4s}
+@keyframes sh{10%,90%{transform:translateX(-2px)}20%,80%{transform:translateX(4px)}30%,50%,70%{transform:translateX(-6px)}40%,60%{transform:translateX(6px)}}
+.tip{margin-top:18px;font-size:11.5px;color:var(--muted);text-align:center;opacity:.85}
+.opt{font-size:11.5px;color:var(--muted);font-weight:400}
+.hintline{margin-top:7px;font-size:11.5px;color:var(--muted);line-height:1.5}
+.hintline code{background:rgba(125,145,255,.13);padding:1px 5px;border-radius:5px;font-size:11px}
+</style>
+</head>
+<body>
+<form class="card{{if .Error}} shake{{end}}" method="post" action="/__gate/login" autocomplete="off">
+  <input type="hidden" name="next" value="{{.Next}}">
+  <div class="brand">
+    <span class="dot"></span>
+    <div>
+      <h1>{{.Title}}</h1>
+      <small>{{.Subtitle}}</small>
+    </div>
+  </div>
+  {{if .NeedPassword}}
+  <label for="pw">访问口令</label>
+  <div class="field">
+    <input id="pw" name="password" type="password" placeholder="请输入口令" required
+           {{if .Locked}}disabled{{else}}{{if not .NeedTOTP}}autofocus{{end}}{{end}}>
+    <button class="eye" type="button" id="eye" aria-label="切换口令可见性">显示</button>
+  </div>
+  {{end}}
+  {{if .NeedTOTP}}
+  <label for="otp">动态验证码</label>
+  <div class="field">
+    <input id="otp" name="code" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6"
+           autocomplete="one-time-code" placeholder="6 位数字" required
+           {{if .Locked}}disabled{{else}}{{if not .NeedPassword}}autofocus{{end}}{{end}}>
+  </div>
+  {{end}}
+  <label for="dstoken" style="margin-top:14px">DSH 令牌 <span class="opt">（{{if .HasSession}}本设备已有 DSH 会话，可留空{{else}}本设备还没有会话，必填{{end}}）</span></label>
+  <div class="field">
+    <input id="dstoken" name="dstoken" type="text" autocomplete="off" spellcheck="false"
+           placeholder="粘贴 token 字符串" {{if .Locked}}disabled{{end}}>
+  </div>
+  <div class="hintline">从服务器获取：<code>docker logs dshai-web 2&gt;&amp;1 | grep -o 'token=[^ ]*' | tail -1</code>（DSH 重启后令牌会变）</div>
+  <button class="go" type="submit" {{if .Locked}}disabled{{end}}>{{if .Locked}}已锁定{{else}}进入{{end}}</button>
+  <div class="msg {{if .Locked}}lock{{else if .Error}}err{{end}}">{{if .Locked}}尝试次数过多，请等待 {{.Remain}} 后再试{{else}}{{.Error}}{{end}}</div>
+  <div class="tip">{{.Tip}}</div>
+</form>
+<script>
+(function(){
+  var pw=document.getElementById('pw'), eye=document.getElementById('eye');
+  if(eye&&pw){eye.addEventListener('click',function(){
+    var show = pw.type === 'password';
+    pw.type = show ? 'text' : 'password';
+    eye.textContent = show ? '隐藏' : '显示';
+    pw.focus();
+  });}
+  var otp=document.getElementById('otp'), tok=document.getElementById('dstoken');
+  var needTok = {{if .TokenNeeded}}true{{else}}false{{end}};
+  if(otp){
+    otp.addEventListener('input',function(){
+      otp.value = otp.value.replace(/\D/g,'').slice(0,6);
+      var tokenReady = !needTok || (tok && tok.value.trim() !== '');
+      if(otp.value.length===6 && !document.querySelector('input#pw') && tokenReady) otp.form.requestSubmit();
+    });
+  }
+  {{if .Locked}}setTimeout(function(){location.reload();}, 60000);{{end}}
+})();
+</script>
+</body>
+</html>
