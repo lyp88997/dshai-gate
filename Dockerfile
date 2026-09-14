@@ -20,6 +20,14 @@ RUN apt-get update \
 RUN node /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-subprocess-local/scripts/ensure-spawn-helper.mjs \
     && find /usr/local/lib/node_modules -name spawn-helper -printf 'BUILD-CHECK %M %p\n'
 
+# 运行时工具补全：CA 根证书 + 技能脚本依赖。
+# 缺 ca-certificates 时 git/curl 走 HTTPS 会报 "server certificate verification
+# failed (CAfile: none)"，github 技能(git clone / gh-api)与 git 协议插件都会失败。
+# 单独成层是为了不动上面昂贵的 npm 层（重建只需几秒而非重下 1.2GB）。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl jq rsync zip unzip \
+    && rm -rf /var/lib/apt/lists/*
+
 # 关键：官方 node 镜像自带 ENTRYPOINT [docker-entrypoint.sh]，会把未知命令当前置成 node。
 # 显式声明 ENTRYPOINT 后，compose 的 command: ["web", ...] 才会被当成 dsh 的子命令。
 ENTRYPOINT ["dsh"]
