@@ -21,6 +21,7 @@ services:
       - ./data:/home/node/.dsh
       - ./workspaces:/home/node/workspaces
       - ./home:/home/node
+      - ./plugins:/home/node/plugins:ro
     command: ["web", "--no-open", "--port", "3082",
               "--trusted-host", "dsh.example.com",
               "--trusted-host", "dsh.example.com:443"]
@@ -33,7 +34,7 @@ services:
 
   gate:
     build: ./gate
-    image: dsh-gate:1.4.0
+    image: dsh-gate:1.5.0
     container_name: dshai-gate
     restart: on-failure:5
     network_mode: host

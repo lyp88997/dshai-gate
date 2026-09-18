@@ -8,6 +8,9 @@
 // 防爆破：单 IP 连续失败 5 次锁 15 分钟；1 小时内累计 20 次锁 1 小时；
 //         全局限流：10 分钟内的失败次数会线性加大响应延迟（上限 4s），抵御分布式尝试；
 //         动态码用过的窗口立即作废（防重放）。
+//
+// 安全日志：登录成功/失败、锁定、动态码重放、令牌换票、未鉴权拦截等事件
+//         写 stdout 并留在内存环形缓冲中，由 /__gate/admin 查看（需已登录）。
 package main
 
 import (
@@ -45,6 +48,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
+	gateVersion  = "1.5.0"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 	totpPeriod   = 30
@@ -59,6 +63,10 @@ const (
 	delayPerFail = 400 * time.Millisecond
 	maxDelay     = 4 * time.Second
 	globalWindow = 10 * time.Minute
+
+	// 安全日志：内存环形缓冲的容量，与「同类事件合并窗口」
+	secLogMax   = 300
+	secCoalesce = 30 * time.Second
 )
 
 var (
@@ -70,6 +78,8 @@ var (
 	sessionDs  int
 	needPw     bool
 	needTotp   bool
+	listenAddr string
+	startedAt  = time.Now()
 
 	replayMu   sync.Mutex
 	lastUsedCt uint64
@@ -161,7 +171,7 @@ func totpAt(counter uint64) string {
 }
 
 // verifyTOTP 返回该验证码所属的时间片；成功时同时做防重放
-func verifyTOTP(input string) (uint64, bool) {
+func verifyTOTP(input, ip string) (uint64, bool) {
 	c := strings.TrimSpace(strings.ReplaceAll(input, " ", ""))
 	if len(c) != totpDigits {
 		return 0, false
@@ -179,7 +189,7 @@ func verifyTOTP(input string) (uint64, bool) {
 		replayed := ct <= lastUsedCt
 		replayMu.Unlock()
 		if replayed {
-			log.Printf("门禁：动态码重放被拒（时间片 %d）", ct)
+			secNote("动态码重放", ip, "时间片 %d 已被使用", ct)
 			return 0, false
 		}
 		return ct, true
@@ -296,6 +306,70 @@ func noteGlobalFail() {
 	glMu.Unlock()
 }
 
+// ---------- 安全日志（内存环形缓冲，供 /__gate/admin 查看） ----------
+//
+// ponytail: 只存在内存里——gate 容器没有任何挂载卷（docker inspect Mounts 为空），
+// 重启即清空。需要长期历史就先给 compose 的 gate 服务加一个卷，再落盘
+// （注意 gate 以 nobody(65534) 运行，写宿主文件要配属主，别踩铁律 2）。
+//
+// 噪声控制：同一 IP 的同类事件在 secCoalesce 内合并为一条并累加次数，
+// 因此 stdout 也只在「新事件」时写一行——否则扫描器能把 docker 日志刷爆。
+// ponytail: 未鉴权拦截同样进环形缓冲，海量分布式扫描仍可能挤掉旧记录（上限 secLogMax 条）。
+
+type secEvent struct {
+	Time  time.Time
+	Kind  string // 登录成功 / 验证失败 / 锁定 / 未鉴权拦截 ...
+	IP    string
+	Text  string
+	Count int
+}
+
+var (
+	secMu   sync.Mutex
+	secLog  []secEvent // 最新的在最后一个
+	secSeen int64      // 累计事件数（含被合并的）
+)
+
+func secNote(kind, ip, format string, args ...any) {
+	text := fmt.Sprintf(format, args...)
+	secMu.Lock()
+	defer secMu.Unlock()
+	secSeen++
+	if n := len(secLog); n > 0 {
+		if last := &secLog[n-1]; last.Kind == kind && last.IP == ip &&
+			time.Since(last.Time) < secCoalesce {
+			last.Count++
+			last.Time = time.Now()
+			last.Text = text
+			return
+		}
+	}
+	log.Printf("门禁：%s ip=%s %s", kind, ip, text)
+	secLog = append(secLog, secEvent{Time: time.Now(), Kind: kind, IP: ip, Text: text, Count: 1})
+	if len(secLog) > secLogMax {
+		secLog = secLog[1:]
+	}
+}
+
+func secSnapshot() ([]secEvent, int64) {
+	secMu.Lock()
+	defer secMu.Unlock()
+	out := make([]secEvent, len(secLog))
+	copy(out, secLog)
+	return out, secSeen
+}
+
+func humanUptime(d time.Duration) string {
+	switch {
+	case d >= 24*time.Hour:
+		return fmt.Sprintf("%d 天 %d 小时", int(d.Hours())/24, int(d.Hours())%24)
+	case d >= time.Hour:
+		return fmt.Sprintf("%d 小时 %d 分钟", int(d.Minutes())/60, int(d.Minutes())%60)
+	default:
+		return fmt.Sprintf("%d 分钟", int(d.Minutes()))
+	}
+}
+
 // ---------- 与 DSH 交互（会话探测 / 令牌换票） ----------
 
 func dshCall(r *http.Request, target string, withBrowserCookies bool) (*http.Response, error) {
@@ -322,7 +396,7 @@ func dshCall(r *http.Request, target string, withBrowserCookies bool) (*http.Res
 func dshHasSession(r *http.Request) bool {
 	resp, err := dshCall(r, upstreamURL.String()+"/", true)
 	if err != nil {
-		log.Printf("门禁：探测 DSH 会话失败: %v", err)
+		secNote("探测 DSH 失败", clientIP(r), "%v", err)
 		return false
 	}
 	defer resp.Body.Close()
@@ -434,7 +508,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	next := sanitizeNext(r.FormValue("next"))
 
 	if locked, rem := lockRemaining(ip); locked {
-		log.Printf("门禁：锁定期间尝试 ip=%s", ip)
+		secNote("锁定期间尝试", ip, "仍在锁定期内，剩余 %s", humanDur(rem))
 		renderLogin(w, http.StatusTooManyRequests, "", true, rem, next, false)
 		return
 	}
@@ -445,11 +519,11 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		noteGlobalFail()
 		n, lockedNow, dur := noteFail(ip)
 		if lockedNow {
-			log.Printf("门禁：失败达上限，锁定 ip=%s 时长=%s", ip, dur)
+			secNote("锁定", ip, "失败达上限，锁定 %s", humanDur(dur))
 			renderLogin(w, http.StatusTooManyRequests, "", true, dur, next, hasSession)
 			return
 		}
-		log.Printf("门禁：验证失败 ip=%s 第 %d 次", ip, n)
+		secNote("验证失败", ip, "第 %d 次：%s", n, msg)
 		renderLogin(w, http.StatusUnauthorized, fmt.Sprintf("%s，还可尝试 %d 次", msg, maxFailures-n), false, 0, next, hasSession)
 	}
 
@@ -462,7 +536,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	var totpCt uint64
 	if needTotp {
-		ct, ok := verifyTOTP(r.FormValue("code"))
+		ct, ok := verifyTOTP(r.FormValue("code"), ip)
 		totpCt = ct
 		if !ok {
 			if needPw {
@@ -486,12 +560,12 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	} else {
 		pairCookie, err := dshPair(r, token)
 		if err != nil {
-			log.Printf("门禁：DSH 令牌换票失败 ip=%s: %v", ip, err)
+			secNote("令牌换票失败", ip, "%v", err)
 			fail("DSH 令牌不正确或已失效（DSH 重启后旧令牌即作废）")
 			return
 		}
 		http.SetCookie(w, pairCookie)
-		log.Printf("门禁：DSH 令牌换票成功 ip=%s", ip)
+		secNote("令牌换票成功", ip, "已换取 DSH 会话 Cookie")
 	}
 	if needTotp {
 		markTotpUsed(totpCt)
@@ -503,16 +577,257 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		Name: cookieName, Value: val, Path: "/", MaxAge: maxAge,
 		HttpOnly: true, Secure: isHTTPS(r), SameSite: http.SameSiteLaxMode,
 	})
-	log.Printf("门禁：登录成功 ip=%s（方式=%s）", ip, subtitleOf())
+	secNote("登录成功", ip, "方式=%s", subtitleOf())
 	http.Redirect(w, r, next, http.StatusSeeOther)
 }
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
+	secNote("登出", clientIP(r), "")
 	http.SetCookie(w, &http.Cookie{
 		Name: cookieName, Value: "", Path: "/", MaxAge: -1,
 		HttpOnly: true, Secure: isHTTPS(r), SameSite: http.SameSiteLaxMode,
 	})
 	http.Redirect(w, r, gatePrefix+"/login", http.StatusSeeOther)
+}
+
+// ---------- 后台：安全日志页 ----------
+
+// adminHTML 直接内嵌在 main.go 里（而不是像 login.html 那样单独一个文件）：
+// gate/Dockerfile 与 scripts/github-publish.sh 各自都有一份「要复制的文件清单」，
+// 少写一处就会出现「本地有、镜像/仓库里没有」的漂移。少一个文件少一个坑。
+const adminHTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="10">
+<title>{{.Title}} · 安全日志</title>
+<style>
+:root{
+  --bg1:#0b1020; --bg2:#141b36; --card:rgba(255,255,255,.075); --cardb:rgba(255,255,255,.16);
+  --fg:#eef2ff; --muted:#a5b0d4; --accent:#6d8bff; --accent2:#9b6dff;
+  --ok:#5ad39a; --warn:#ffb547; --err:#ff8098;
+  --shadow:0 24px 70px rgba(0,0,0,.5);
+}
+@media (prefers-color-scheme: light){
+  :root{ --bg1:#eef1f8; --bg2:#dde5f6; --card:rgba(255,255,255,.72); --cardb:rgba(255,255,255,.95);
+         --fg:#161d33; --muted:#5b6689; --accent:#3f5bd6; --accent2:#7a4fd6;
+         --ok:#0f9d58; --warn:#b06a00; --err:#d3304f; --shadow:0 20px 55px rgba(30,45,90,.18); }
+}
+*{box-sizing:border-box}
+body{
+  margin:0;padding:26px 20px 40px;min-height:100vh;color:var(--fg);
+  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Roboto,sans-serif;
+  background:
+    radial-gradient(900px 520px at 10% -6%, rgba(109,139,255,.28), transparent 60%),
+    radial-gradient(760px 520px at 92% 104%, rgba(155,109,255,.24), transparent 60%),
+    linear-gradient(160deg,var(--bg1),var(--bg2));
+  background-attachment:fixed;
+}
+.wrap{max-width:1060px;margin:0 auto}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+.brand{display:flex;align-items:center;gap:12px;flex:1 1 260px}
+.dot{width:11px;height:11px;border-radius:50%;flex:0 0 auto;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 0 0 5px rgba(109,139,255,.16)}
+h1{font-size:17px;margin:0;letter-spacing:.3px}
+h1 small{display:block;color:var(--muted);font-weight:400;font-size:12px;margin-top:3px}
+.actions{display:flex;gap:9px;flex-wrap:wrap}
+.btn{display:inline-block;text-decoration:none;padding:9px 14px;border-radius:11px;font-size:13px;font-weight:600;
+  color:#fff;background:linear-gradient(135deg,var(--accent),var(--accent2));border:1px solid transparent;
+  transition:filter .15s, transform .12s}
+.btn:hover{filter:brightness(1.08)}
+.btn:active{transform:translateY(1px)}
+.btn.ghost{color:var(--fg);background:var(--card);border-color:var(--cardb);font-weight:500}
+.btn.danger{color:var(--err)}
+.card{background:var(--card);border:1px solid var(--cardb);border-radius:18px;padding:18px 20px;margin-bottom:16px;
+  box-shadow:var(--shadow);
+  -webkit-backdrop-filter:blur(16px) saturate(140%);backdrop-filter:blur(16px) saturate(140%)}
+.card h2{font-size:12.5px;margin:0 0 12px;color:var(--muted);font-weight:600;letter-spacing:.4px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:14px 18px}
+.stat b{display:block;color:var(--muted);font-size:11.5px;font-weight:500;margin-bottom:3px}
+.stat span{font-size:13.5px;word-break:break-word}
+.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;margin:2px 4px 2px 0;
+  color:var(--warn);background:rgba(255,181,71,.14);border:1px solid rgba(255,181,71,.3)}
+.tablewrap{overflow-x:auto;margin:0 -4px}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:620px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--cardb);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:11.5px;letter-spacing:.4px;white-space:nowrap}
+tbody tr:hover{background:rgba(125,145,255,.06)}
+td.t{white-space:nowrap;color:var(--muted);font-variant-numeric:tabular-nums}
+td.ip{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+td.n{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
+.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;white-space:nowrap;border:1px solid transparent}
+.badge-ok{color:var(--ok);background:rgba(90,211,154,.14);border-color:rgba(90,211,154,.3)}
+.badge-err{color:var(--err);background:rgba(255,128,152,.14);border-color:rgba(255,128,152,.3)}
+.badge-warn{color:var(--warn);background:rgba(255,181,71,.14);border-color:rgba(255,181,71,.3)}
+.badge-info{color:var(--muted);background:rgba(125,145,255,.12);border-color:var(--cardb)}
+.empty{color:var(--muted);text-align:center;padding:22px 0}
+.muted{color:var(--muted);font-size:12.5px}
+.foot{text-align:center;font-size:11.5px;color:var(--muted);margin-top:6px}
+.foot a{color:var(--muted)}
+@media (max-width:520px){
+  body{padding:18px 13px 30px}
+  .card{padding:15px 14px;border-radius:15px}
+  .btn{padding:8px 11px;font-size:12.5px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>{{.Title}} · 安全日志<small>v{{.Version}} · 已运行 {{.Uptime}} · 每 10 秒自动刷新</small></h1>
+  </div>
+  <nav class="actions">
+    <a class="btn" href="/" target="_blank" rel="noopener">进入 DSH ↗</a>
+    <a class="btn ghost" href="/__gate/admin">立即刷新</a>
+    <a class="btn ghost danger" href="/__gate/logout">退出登录</a>
+  </nav>
+</header>
+
+<div class="card">
+  <h2>当前状态</h2>
+  <div class="stats">
+    <div class="stat"><b>登录方式</b><span>{{.Mode}}</span></div>
+    <div class="stat"><b>本设备会话</b><span>剩余 {{.SessionLeft}}</span></div>
+    <div class="stat"><b>监听 → 上游</b><span>{{.Listen}} → {{.Upstream}}</span></div>
+    <div class="stat"><b>事件计数</b><span>{{.Total}} 条（显示最近 {{.Shown}} 条）</span></div>
+    <div class="stat"><b>全局限流</b><span>当前响应延迟 {{.Delay}}</span></div>
+    <div class="stat"><b>锁定中的 IP</b><span>{{if .Locks}}{{range .Locks}}<span class="pill">{{.IP}} · 剩余 {{.Until}} · 失败 {{.Fails}} 次</span>{{end}}{{else}}无{{end}}</span></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>最近事件（最新在上；同一 IP 的同类事件 30 秒内合并计数）</h2>
+  <div class="tablewrap"><table>
+    <thead><tr>
+      <th scope="col">时间</th><th scope="col">事件</th><th scope="col">来源 IP</th><th scope="col">说明</th><th scope="col" style="text-align:right">次数</th>
+    </tr></thead>
+    <tbody>
+    {{range .Events}}<tr>
+      <td class="t">{{.Time}}</td>
+      <td><span class="badge badge-{{.Tone}}">{{.Kind}}</span></td>
+      <td class="ip">{{.IP}}</td>
+      <td>{{.Text}}</td>
+      <td class="n">{{.Count}}</td>
+    </tr>
+    {{else}}<tr><td colspan="5" class="empty">还没有记录。上面的动作都会出现在这里。</td></tr>
+    {{end}}
+    </tbody>
+  </table></div>
+</div>
+
+<div class="foot">只保留内存中最近 {{.Max}} 条，容器重启即清空 · 短地址 <a href="/gate">/gate</a></div>
+</div>
+</body>
+</html>
+`
+
+var adminTpl = template.Must(template.New("admin").Parse(adminHTML))
+
+type adminEvent struct {
+	Time  string
+	Kind  string
+	Tone  string // ok / warn / err / info，决定徽章配色
+	IP    string
+	Text  string
+	Count int
+}
+
+type adminLock struct {
+	IP    string
+	Until string
+	Fails int
+}
+
+type adminView struct {
+	Title       string
+	Version     string
+	Uptime      string
+	Mode        string
+	SessionDays int
+	SessionLeft string
+	Listen      string
+	Upstream    string
+	Total       int64
+	Shown       int
+	Delay       string
+	Max         int
+	Locks       []adminLock
+	Events      []adminEvent
+}
+
+// toneOf 把事件种类映射成配色：失败类红、拦截类黄、成功类绿、其余中性
+func toneOf(kind string) string {
+	switch kind {
+	case "登录成功", "令牌换票成功", "登出":
+		return "ok"
+	case "验证失败", "锁定", "动态码重放", "令牌换票失败", "上游错误":
+		return "err"
+	case "未鉴权拦截", "锁定期间尝试":
+		return "warn"
+	default:
+		return "info"
+	}
+}
+
+// sessionLeft 从本设备 Cookie 的过期时间算出剩余有效期
+func sessionLeft(r *http.Request) string {
+	c, err := r.Cookie(cookieName)
+	if err != nil {
+		return "—"
+	}
+	parts := strings.Split(c.Value, ".")
+	if len(parts) != 3 {
+		return "—"
+	}
+	exp, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return "—"
+	}
+	d := time.Until(time.Unix(exp, 0))
+	if d <= 0 {
+		return "已过期"
+	}
+	return humanUptime(d)
+}
+
+// lockedSnapshot 返回仍在锁定期的 IP（供后台页展示）
+func lockedSnapshot() []adminLock {
+	limMu.Lock()
+	defer limMu.Unlock()
+	now := time.Now()
+	var out []adminLock
+	for ip, s := range limM {
+		if s.until.After(now) {
+			out = append(out, adminLock{IP: ip, Until: humanDur(time.Until(s.until)), Fails: s.fails})
+		}
+	}
+	return out
+}
+
+func handleAdmin(w http.ResponseWriter, r *http.Request) {
+	evs, total := secSnapshot()
+	rows := make([]adminEvent, 0, len(evs))
+	for i := len(evs) - 1; i >= 0; i-- { // 最新在最上面
+		e := evs[i]
+		rows = append(rows, adminEvent{
+			Time: e.Time.Format("01-02 15:04:05"), Kind: e.Kind, Tone: toneOf(e.Kind),
+			IP: e.IP, Text: e.Text, Count: e.Count,
+		})
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	_ = adminTpl.Execute(w, adminView{
+		Title: siteTitle, Version: gateVersion, Uptime: humanUptime(time.Since(startedAt)),
+		Mode: subtitleOf(), SessionDays: sessionDs, SessionLeft: sessionLeft(r),
+		Listen: listenAddr, Upstream: upstreamURL.String(),
+		Total: total, Shown: len(rows), Delay: globalDelay().String(), Max: secLogMax,
+		Locks: lockedSnapshot(), Events: rows,
+	})
 }
 
 func withGate(next http.Handler) http.Handler {
@@ -524,11 +839,22 @@ func withGate(next http.Handler) http.Handler {
 		case gatePrefix + "/logout":
 			handleLogout(w, r)
 			return
+		case "/gate":
+			// 短地址：好记、可收藏。未登录时会被后台页拦到登录页，
+			// 登录成功后 next 会把人送回 /__gate/admin
+			http.Redirect(w, r, gatePrefix+"/admin", http.StatusFound)
+			return
 		}
 		if c, err := r.Cookie(cookieName); err == nil && cookieValid(c.Value) {
+			// 后台页与门禁同权限，不额外开鉴权口子
+			if r.URL.Path == gatePrefix+"/admin" {
+				handleAdmin(w, r)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
+		secNote("未鉴权拦截", clientIP(r), "%s %s", r.Method, r.URL.Path)
 		if wantsHTML(r) {
 			renderLogin(w, http.StatusUnauthorized, "", false, 0, r.URL.RequestURI(), dshHasSession(r))
 			return
@@ -617,7 +943,7 @@ func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("上游错误 %s %s: %v", r.Method, r.URL.Path, err)
+			secNote("上游错误", clientIP(r), "%s %s: %v", r.Method, r.URL.Path, err)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte(`<meta charset="utf-8"><h3>DSH 暂不可达</h3>` +
@@ -637,6 +963,7 @@ func pathOf(resp *http.Response) string {
 
 func main() {
 	listen := env("GATE_LISTEN", "127.0.0.1:2299")
+	listenAddr = listen
 	raw := env("GATE_UPSTREAM", "http://127.0.0.1:3082")
 	inject := env("GATE_INJECT", "1") == "1"
 	siteTitle = env("GATE_SITE_TITLE", "Harness")
@@ -671,8 +998,8 @@ func main() {
 	}
 	upstreamURL = target
 
-	log.Printf("dshai-gate 启动: http://%s -> %s（%s，会话=%d 天，注入=%v）",
-		listen, target, subtitleOf(), sessionDs, inject)
+	secNote("启动", "-", "v%s 监听 %s → %s（%s，会话=%d 天，注入=%v）",
+		gateVersion, listen, target, subtitleOf(), sessionDs, inject)
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           withGate(newProxy(target, inject)),

@@ -1,10 +1,11 @@
 #!/bin/sh
 # 门禁链路探针 v2：同时携带「门禁会话 Cookie」与「DSH 会话 Cookie」，
 # 走完整链路（门禁 -> DSH）验证各接口。不打印任何密钥或 Cookie 值。
+# 用法：gate-probe.sh [门禁地址]   默认 http://127.0.0.1:2299
 set -eu
 
 ENVF=/opt/dshai/.env
-GATE=http://127.0.0.1:2299
+GATE=${1:-http://127.0.0.1:2299}
 DSH=http://127.0.0.1:3082
 HOSTHDR="dsh.example.com"
 JAR=/tmp/dsh.jar
@@ -58,4 +59,26 @@ printf '  %-42s [%s]\n' "无 Cookie /api/task-board/state" \
 printf '  %-42s [%s]\n' "无 Cookie / (浏览器导航)" \
   "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOSTHDR" -H 'Accept: text/html' "$GATE/")"
 
-rm -f /tmp/probe.out "$JAR"
+echo "== ④ 门禁后台与短地址（/gate）=="
+printf '  %-42s [%s]\n' "无 Cookie /__gate/admin（应 401）" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOSTHDR" "$GATE/__gate/admin")"
+ADMCODE=$(curl -s -o /tmp/admin.out -w '%{http_code}' -H "Host: $HOSTHDR" -b "$GATECOOKIE" "$GATE/__gate/admin")
+if [ "$ADMCODE" = "200" ] && grep -q '安全日志' /tmp/admin.out; then
+  printf '  %-42s [%s] 含日志标题 ✓\n' "带 Cookie /__gate/admin" "$ADMCODE"
+else
+  printf '  %-42s [%s] ✗ 后台页异常\n' "带 Cookie /__gate/admin" "$ADMCODE"
+fi
+for t in "进入 DSH" "立即刷新" "退出登录"; do
+  if grep -q "$t" /tmp/admin.out; then
+    printf '  %-42s ✓\n' "后台页操作区含「$t」"
+  else
+    printf '  %-42s ✗ 缺失\n' "后台页操作区含「$t」"
+  fi
+done
+printf '  %-42s [%s] -> %s\n' "/gate 短地址（应 302 到后台页）" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOSTHDR" "$GATE/gate")" \
+  "$(curl -s -o /dev/null -w '%{redirect_url}' -H "Host: $HOSTHDR" "$GATE/gate")"
+printf '  %-42s %s 处\n' "登录页含可复制命令块" \
+  "$(curl -s -H "Host: $HOSTHDR" -H 'Accept: text/html' "$GATE/__gate/login" | grep -c 'data-copy=')"
+
+rm -f /tmp/probe.out /tmp/admin.out "$JAR"

@@ -20,7 +20,7 @@ chk "登录页不泄露DSH内容" "$(grep -c 'dsh web auth\|__DSH_TRANSPORT__' /
 chk "登录页含 DSH 令牌框" "$(grep -c 'name="dstoken"' /tmp/.sc_login 2>/dev/null)" "1"
 chk "未登录 API 被拦" "$(curl -s -o /dev/null -m 8 -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:2299/api/settings.describe)" "401"
 chk "开放路由已被门禁挡" "$(curl -s -o /dev/null -m 8 -w '%{http_code}' http://127.0.0.1:2299/plugins/events)" "401"
-chk "门禁已启用(启动日志)" "$(docker logs dshai-gate 2>&1 | grep -c 'dshai-gate 启动')" "1"
+chk "门禁已启用(启动日志)" "$(docker logs dshai-gate 2>&1 | grep 'dshai-gate 启动' | tail -1 | grep -c .)" "1"
 chk "旧实例已清除" "$(docker ps -a --filter name=^dsh-web$ --format {{.Names}} | grep -q . && echo 仍存在 || echo removed)" "removed"
 
 echo "  ── 通过 $ok 项，失败 $ng 项"

@@ -69,8 +69,16 @@ button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
 @keyframes sh{10%,90%{transform:translateX(-2px)}20%,80%{transform:translateX(4px)}30%,50%,70%{transform:translateX(-6px)}40%,60%{transform:translateX(6px)}}
 .tip{margin-top:18px;font-size:11.5px;color:var(--muted);text-align:center;opacity:.85}
 .opt{font-size:11.5px;color:var(--muted);font-weight:400}
-.hintline{margin-top:7px;font-size:11.5px;color:var(--muted);line-height:1.5}
-.hintline code{background:rgba(125,145,255,.13);padding:1px 5px;border-radius:5px;font-size:11px}
+.hintline{margin-top:9px;font-size:11.5px;color:var(--muted);line-height:1.55}
+.cmd{display:flex;align-items:center;gap:8px;margin-top:8px;padding:9px 10px;border-radius:11px;
+  background:rgba(125,145,255,.11);border:1px solid var(--cardb)}
+.cmd code{flex:1;min-width:0;font:11.5px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New",monospace;
+  color:var(--fg);opacity:.94;word-break:break-all;cursor:pointer;user-select:all}
+.cmd .copy{flex:0 0 auto;border:0;border-radius:8px;padding:6px 11px;cursor:pointer;font-size:11.5px;font-weight:600;
+  color:#fff;background:linear-gradient(135deg,var(--accent),var(--accent2));transition:filter .15s,background .2s}
+.cmd .copy:hover{filter:brightness(1.08)}
+.cmd .copy.ok{background:linear-gradient(135deg,#3fae7a,#2f9c6a)}
+.cmd .copy:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 </style>
 </head>
 <body>
@@ -104,7 +112,14 @@ button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
     <input id="dstoken" name="dstoken" type="text" autocomplete="off" spellcheck="false"
            placeholder="粘贴 token 字符串" {{if .Locked}}disabled{{end}}>
   </div>
-  <div class="hintline">从服务器获取：<code>docker logs dshai-web 2&gt;&amp;1 | grep -o 'token=[^ ]*' | tail -1</code>（DSH 重启后令牌会变）</div>
+  {{if .TokenNeeded}}
+  <div class="hintline">令牌怎么来：在服务器执行下面这条命令，再点「复制」</div>
+  <div class="cmd">
+    <code id="dstok-cmd" data-copy="docker logs dshai-web 2>&1 | grep -o 'token=[^ ]*' | tail -1">docker logs dshai-web 2&gt;&amp;1 | grep -o 'token=[^ ]*' | tail -1</code>
+    <button class="copy" type="button" id="copybtn" aria-label="复制获取 DSH 令牌的命令">复制</button>
+  </div>
+  <div class="hintline">DSH 每次重启令牌都会变；若本设备已有会话，上面这栏可留空。</div>
+  {{end}}
   <button class="go" type="submit" {{if .Locked}}disabled{{end}}>{{if .Locked}}已锁定{{else}}进入{{end}}</button>
   <div class="msg {{if .Locked}}lock{{else if .Error}}err{{end}}">{{if .Locked}}尝试次数过多，请等待 {{.Remain}} 后再试{{else}}{{.Error}}{{end}}</div>
   <div class="tip">{{.Tip}}</div>
@@ -126,6 +141,28 @@ button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
       var tokenReady = !needTok || (tok && tok.value.trim() !== '');
       if(otp.value.length===6 && !document.querySelector('input#pw') && tokenReady) otp.form.requestSubmit();
     });
+  }
+  var cb=document.getElementById('copybtn'), cmdEl=document.getElementById('dstok-cmd');
+  if(cb && cmdEl){
+    var cmdText = cmdEl.dataset.copy || cmdEl.textContent.trim();
+    function flip(){ cb.textContent='已复制'; cb.classList.add('ok');
+      setTimeout(function(){ cb.textContent='复制'; cb.classList.remove('ok'); }, 1600); }
+    function legacy(){
+      var ta=document.createElement('textarea');
+      ta.value=cmdText; ta.setAttribute('readonly','');
+      ta.style.position='fixed'; ta.style.top='-1000px';
+      document.body.appendChild(ta); ta.select();
+      try{ document.execCommand('copy'); }catch(e){}
+      document.body.removeChild(ta); flip();
+    }
+    function copy(){
+      // 需要 https 环境下 clipboard 才可用；不可用时退回 execCommand
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(cmdText).then(flip, legacy);
+      } else { legacy(); }
+    }
+    cb.addEventListener('click', copy);
+    cmdEl.addEventListener('click', copy);   // 点命令本身也能复制
   }
   {{if .Locked}}setTimeout(function(){location.reload();}, 60000);{{end}}
 })();
