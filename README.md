@@ -171,11 +171,30 @@ DSH 启动时会打印一个一次性配对链接（`http://127.0.0.1:3082/?toke
 | `/gate` | 短地址，跳转到后台页 |
 | `/__gate/admin` | 后台页本体，受同一套会话 Cookie 保护（未登录先跳登录页） |
 
-后台页有三块内容：
+后台页有四块内容：
 
 - **当前状态**：登录方式、本设备会话剩余时间、监听 → 上游、事件计数、全局限流延迟、锁定中的 IP
+- **DSH 控制**：`重启 DSH` 按钮 + 重启状态 / 最近一次发起 / 结果
 - **操作区**：`进入 DSH ↗`（新标签打开主界面）、`立即刷新`、`退出登录`
 - **最近事件**：时间 / 事件 / 来源 IP / 说明 / 次数，每 10 秒自动刷新
+
+### 重启 DSH
+
+装了插件、改了配置需要重启才生效时，用后台页的 `重启 DSH` 按钮，不必登服务器。
+
+- 按钮由门禁**以回环身份**调用 DSH 自己的重启接口（`POST /dsh-market/restart`），
+  并轮询确认它真的停下又起来，结果写在页面上（页面每 10 秒自动刷新，重启期间盯着看即可）。
+- ⚠️ **本服务的 compose 必须是 `restart: unless-stopped`。** DSH 收到停止信号是
+  **优雅退出、退出码 0**，而 `restart: on-failure` 只认非 0 退出码 —— 用 on-failure 时
+  点一次重启就等于**把服务彻底停掉**（本仓库 compose.yaml 因此用 `unless-stopped`）。
+- 这条路依赖 dshmarket 插件已加载（重启路由由它注册）。DSH 完全起不来时按钮也救不了，
+  那种情况要登服务器用 `docker compose up -d` 拉。
+- 同一时刻只允许一个重启在跑；按钮要求已登录（与后台页同一套会话 Cookie），
+  且跨站表单带不上 SameSite=Lax 的 Cookie，天然免 CSRF。
+
+> 顺便：门禁反代对 `/dsh-market/` 下的请求会**擦掉 `X-Forwarded-For` 等转发痕迹**。
+> 市场自己那道「无转发头 = 本机直连」的严门会把经反代来的合法请求一律 403，
+> 于是市场里的「立即重启」按钮原先永远失败。上游不读这几个头，擦掉无副作用。
 
 <img src="docs/admin.png" width="820" alt="dshai-gate 后台页：状态卡片 + 安全事件表">
 
@@ -223,7 +242,7 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 | 脚本 | 用途 |
 | --- | --- |
 | `scripts/selfcheck.sh` | 一键自检：容器健康、门禁是否拦住未授权、登录页是否正确、开放路由是否被挡、旧实例状态 |
-| `scripts/gate-probe.sh` | **门禁链路探针**：自签会话走完整链路，逐项验证插件接口 200、核心接口未受影响、未登录仍是 401、后台页与 `/gate` 短地址正常（**改过 `loopbackOnlyPrefixes` 后必跑**；也可带一个公网 URL 参数，走 nginx 做全链路回归） |
+| `scripts/gate-probe.sh` | **门禁链路探针**：自签会话走完整链路，逐项验证插件接口 200、核心接口未受影响、未登录仍是 401、后台页与 `/gate` 短地址正常（**改过 `loopbackOnlyPrefixes` 或 `processControlPrefixes` 后必跑**；也可带一个公网 URL 参数，走 nginx 做全链路回归） |
 | `scripts/perm-guard.sh` | **起容器前必跑**：检查数据目录里有没有容器读不到的条目（否则 DSH 崩溃重启） |
 | `scripts/set-password.sh` | 设置 / 更换口令 |
 | `scripts/set-totp.sh` | 生成 TOTP 密钥；**先验证一次再写配置**，避免把自己锁在门外 |
@@ -235,7 +254,7 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 - **fail-closed**：没有任何认证配置时**拒绝启动**（宁可 502，也不留一扇没锁的门）
 - **只绑回环**：`GATE_LISTEN` 默认 `127.0.0.1`，不要改成 `0.0.0.0`
 - **密钥只从环境变量注入**：仓库与镜像里不含任何凭据；`.gitignore` 也挡掉了 `.env`、初始口令文件、数据目录
-- **不伪造请求头**：Host / Origin / Sec-Fetch-* **默认**一律原样透传，因此不存在 Cookie 归属漂移与重定向死循环。唯一例外是 `loopbackOnlyPrefixes` 列出的插件接口 —— 它们只认回环身份，而那些都是纯 API 请求，不涉及页面 Cookie 的归属
+- **不伪造请求头**：Host / Origin / Sec-Fetch-* **默认**一律原样透传，因此不存在 Cookie 归属漂移与重定向死循环。两处例外：`loopbackOnlyPrefixes` 列出的插件接口（只认回环身份，都是纯 API 请求，不涉及页面 Cookie 归属），以及 `processControlPrefixes`（`/dsh-market/`，只**擦掉** `X-Forwarded-For` / `X-Real-IP` / `Forwarded`，不改 Host / Origin）
 - **不做多余的事**：不实现用户系统、不做 OAuth、不引入数据库 —— 一台机器一个人，够用即可
 
 ## 许可与致谢

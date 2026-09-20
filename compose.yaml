@@ -8,7 +8,7 @@ services:
         DSH_VERSION: "0.1.5-rc.1"
     image: dsh-official:0.1.5-rc.1
     container_name: dshai-web
-    restart: on-failure:5
+    restart: unless-stopped
     init: true
     network_mode: host
     mem_limit: 800m
@@ -34,9 +34,9 @@ services:
 
   gate:
     build: ./gate
-    image: dsh-gate:1.5.0
+    image: dsh-gate:1.5.1
     container_name: dshai-gate
-    restart: on-failure:5
+    restart: unless-stopped
     network_mode: host
     environment:
       - GATE_LISTEN=127.0.0.1:2299

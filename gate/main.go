@@ -48,7 +48,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.5.0"
+	gateVersion  = "1.5.1"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 	totpPeriod   = 30
@@ -639,6 +639,10 @@ h1 small{display:block;color:var(--muted);font-weight:400;font-size:12px;margin-
 .btn:active{transform:translateY(1px)}
 .btn.ghost{color:var(--fg);background:var(--card);border-color:var(--cardb);font-weight:500}
 .btn.danger{color:var(--err)}
+button.btn{font-family:inherit;font-size:13px;cursor:pointer}
+button.btn:disabled{opacity:.55;cursor:default;filter:none}
+.restartbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:15px}
+.restartbar .muted{flex:1 1 280px;min-width:210px}
 .card{background:var(--card);border:1px solid var(--cardb);border-radius:18px;padding:18px 20px;margin-bottom:16px;
   box-shadow:var(--shadow);
   -webkit-backdrop-filter:blur(16px) saturate(140%);backdrop-filter:blur(16px) saturate(140%)}
@@ -699,6 +703,19 @@ td.n{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
 </div>
 
 <div class="card">
+  <h2>DSH 控制</h2>
+  <div class="stats">
+    <div class="stat"><b>重启状态</b><span>{{if .RestartBusy}}<span class="badge badge-warn">进行中</span>{{else}}<span class="badge badge-ok">就绪</span>{{end}}</span></div>
+    <div class="stat"><b>最近一次发起</b><span>{{if .RestartAt}}{{.RestartAt}}{{else}}还没有{{end}}</span></div>
+    <div class="stat"><b>结果</b><span>{{if .RestartResult}}{{.RestartResult}}{{else}}—{{end}}</span></div>
+  </div>
+  <form method="post" action="/__gate/restart" class="restartbar">
+    <button class="btn" type="submit"{{if .RestartBusy}} disabled{{end}}>重启 DSH</button>
+    <span class="muted">装了插件、改了配置，需要重启才生效时用这里。会中断正在进行的对话约 30 秒；重启期间本页每 10 秒自动刷新，进度就在上面。</span>
+  </form>
+</div>
+
+<div class="card">
   <h2>最近事件（最新在上；同一 IP 的同类事件 30 秒内合并计数）</h2>
   <div class="tablewrap"><table>
     <thead><tr>
@@ -756,6 +773,10 @@ type adminView struct {
 	Max         int
 	Locks       []adminLock
 	Events      []adminEvent
+
+	RestartBusy   bool
+	RestartAt     string
+	RestartResult string
 }
 
 // toneOf 把事件种类映射成配色：失败类红、拦截类黄、成功类绿、其余中性
@@ -807,6 +828,125 @@ func lockedSnapshot() []adminLock {
 	return out
 }
 
+// ---------- 后台页的「重启 DSH」 ----------
+
+// 同一时刻只允许一个重启在跑；进度留在页面上，靠后台页 10 秒自动刷新呈现。
+var restartState struct {
+	mu      sync.Mutex
+	running bool
+	at      string
+	result  string
+}
+
+func restartSnapshot() (busy bool, at, result string) {
+	restartState.mu.Lock()
+	defer restartState.mu.Unlock()
+	return restartState.running, restartState.at, restartState.result
+}
+
+// restartDSH 以「本机直连」的身份请 DSH 重启自己。
+//
+// 市场的重启路由把「回环对端 + 无任何转发头 + Origin 的 authority 等于 Host」
+// 当作唯一凭据 —— 实测连 Cookie / 令牌都不要（这也正是它能被本机任何进程调用的原因）。
+// 所以这里刻意用回环 Host 与 Origin、且不设任何 X-Forwarded-*。
+// 前提是 GATE_UPSTREAM 指向 127.0.0.1，否则对端不是回环，这道门会拒。
+//
+// 注意：这条路依赖 dshmarket 插件已加载（路由由它注册）；DSH 完全起不来时
+// 这个按钮也救不了 —— 那种情况必须由宿主的 docker 来拉。
+func restartDSH() (int, string) {
+	u := *upstreamURL
+	u.Path = "/dsh-market/restart"
+	req, err := http.NewRequest(http.MethodPost, u.String(), strings.NewReader("{}"))
+	if err != nil {
+		return 0, err.Error()
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://"+u.Host)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+	return resp.StatusCode, strings.TrimSpace(string(body))
+}
+
+func dshListening() bool {
+	c, err := net.DialTimeout("tcp", upstreamURL.Host, 800*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+// waitDSHRestart 先等 DSH 真的停下，再等它起来，把真实结果写回页面。
+//
+// 容器里 DSH 收到停止信号是优雅退出（退出码 0），能不能被拉起来完全取决于
+// compose 的 restart 策略：on-failure 不会重启退出码 0 的容器，必须 unless-stopped。
+// 所以「等不到起来」这条分支要把这个原因直接说出来，而不是含糊地报失败。
+func waitDSHRestart() string {
+	start := time.Now()
+	down := false
+	for time.Since(start) < 30*time.Second {
+		if !dshListening() {
+			down = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	if !down {
+		return "指令已被接受，但 30 秒内没看到 DSH 停止 —— 请到服务器确认"
+	}
+	for time.Since(start) < 300*time.Second {
+		if dshListening() {
+			return fmt.Sprintf("已重启完成，全程 %s", time.Since(start).Round(time.Second))
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return "DSH 已停止，但 300 秒内没起来 —— 检查容器重启策略是否为 unless-stopped"
+}
+
+// handleRestart 后台页的重启按钮（withGate 已保证只有已登录会话能到这里）。
+// POST + SameSite=Lax 的会话 Cookie ⇒ 跨站表单带不上 Cookie，天然免 CSRF。
+func handleRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "只接受 POST", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := clientIP(r)
+	restartState.mu.Lock()
+	if restartState.running {
+		restartState.mu.Unlock()
+		secNote("重启 DSH", ip, "已有重启在进行中，忽略本次请求")
+		http.Redirect(w, r, gatePrefix+"/admin", http.StatusSeeOther)
+		return
+	}
+	restartState.running = true
+	restartState.at = time.Now().Format("01-02 15:04:05")
+	restartState.result = "已发出指令，等待 DSH 停止…"
+	restartState.mu.Unlock()
+
+	secNote("重启 DSH", ip, "已从后台页发起重启")
+	go func() {
+		code, detail := restartDSH()
+		out := ""
+		if code != http.StatusAccepted {
+			out = fmt.Sprintf("上游拒绝（HTTP %d）：%s", code, detail)
+		} else {
+			out = waitDSHRestart()
+		}
+		restartState.mu.Lock()
+		restartState.running = false
+		restartState.result = out
+		restartState.mu.Unlock()
+		secNote("重启 DSH", ip, "结果：%s", out)
+	}()
+	http.Redirect(w, r, gatePrefix+"/admin", http.StatusSeeOther)
+}
+
 func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	evs, total := secSnapshot()
 	rows := make([]adminEvent, 0, len(evs))
@@ -821,12 +961,14 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
+	busy, at, result := restartSnapshot()
 	_ = adminTpl.Execute(w, adminView{
 		Title: siteTitle, Version: gateVersion, Uptime: humanUptime(time.Since(startedAt)),
 		Mode: subtitleOf(), SessionDays: sessionDs, SessionLeft: sessionLeft(r),
 		Listen: listenAddr, Upstream: upstreamURL.String(),
 		Total: total, Shown: len(rows), Delay: globalDelay().String(), Max: secLogMax,
 		Locks: lockedSnapshot(), Events: rows,
+		RestartBusy: busy, RestartAt: at, RestartResult: result,
 	})
 }
 
@@ -849,6 +991,10 @@ func withGate(next http.Handler) http.Handler {
 			// 后台页与门禁同权限，不额外开鉴权口子
 			if r.URL.Path == gatePrefix+"/admin" {
 				handleAdmin(w, r)
+				return
+			}
+			if r.URL.Path == gatePrefix+"/restart" {
+				handleRestart(w, r)
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -889,6 +1035,31 @@ func loopbackOnlyPath(path string) bool {
 	return false
 }
 
+// processControlPrefixes 列出「拒绝一切转发痕迹」的市场接口前缀。
+//
+// 插件市场（dshmarket）的重启与自卸载路由用 trustedRestartRequest 判定：
+// 对端是回环、且**完全没有** Forwarded / X-Forwarded-For / X-Real-IP 任一痕迹、
+// 且 Origin 的 authority 等于 Host —— 三者齐备才放行。它把「有转发头」直接
+// 等同于「来的是代理，不是本人」，这是有意为之的安全设计。
+//
+// 而 Go 反代的 SetXForwarded() 对每个上游请求都必然补上 X-Forwarded-For，
+// 于是市场里的「立即重启」按钮经门禁永远失败（实测 403
+// "restart is limited to same-origin loopback requests"；去掉这一个头即放行，
+// 因为 Host 与 Origin 本就相等、对端本就是回环）。
+//
+// 门禁本身就是那道已完成鉴权的回环入口，与 loopbackOnlyPrefixes 同理：
+// 经它转发即代表身份可信。这里只擦转发头，不动 Host / Origin。
+var processControlPrefixes = []string{"/dsh-market/"}
+
+func processControlPath(path string) bool {
+	for _, prefix := range processControlPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------- 反代 ----------
 
 func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
@@ -908,6 +1079,14 @@ func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
 				}
 			}
 			pr.SetXForwarded()
+			// ★ 市场进程控制类接口：擦掉转发痕迹。市场自己那道「无转发头 =
+			//   本机直连」的严门会把经门禁来的合法请求一律 403（重启按钮失效）。
+			//   上游根本不读这几个头，擦掉无副作用。
+			if processControlPath(pr.In.URL.Path) {
+				pr.Out.Header.Del("X-Forwarded-For")
+				pr.Out.Header.Del("X-Real-IP")
+				pr.Out.Header.Del("Forwarded")
+			}
 			// ★ 必须禁用上游压缩，否则响应体是 gzip，注入静默失效
 			pr.Out.Header.Set("Accept-Encoding", "identity")
 		},
