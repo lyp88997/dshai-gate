@@ -190,11 +190,21 @@ DSH 启动时会打印一个一次性配对链接（`http://127.0.0.1:3082/?toke
 - 这条路依赖 dshmarket 插件已加载（重启路由由它注册）。DSH 完全起不来时按钮也救不了，
   那种情况要登服务器用 `docker compose up -d` 拉。
 - 同一时刻只允许一个重启在跑；按钮要求已登录（与后台页同一套会话 Cookie），
-  且跨站表单带不上 SameSite=Lax 的 Cookie，天然免 CSRF。
+  并额外做**同源校验**（`Sec-Fetch-Site` 优先，缺省时比对 `Origin` 与 `Host`）。
+  会话 Cookie 是 `SameSite=Lax`，跨站表单本来就带不上；同源校验是纵深防御。
 
-> 顺便：门禁反代对 `/dsh-market/` 下的请求会**擦掉 `X-Forwarded-For` 等转发痕迹**。
-> 市场自己那道「无转发头 = 本机直连」的严门会把经反代来的合法请求一律 403，
-> 于是市场里的「立即重启」按钮原先永远失败。上游不读这几个头，擦掉无副作用。
+> **为什么门禁反代要擦转发头**：市场自己那道「无转发头 = 本机直连」的严门会把经反代来的
+> 合法请求一律 403，于是市场横幅上的「立即重启」按钮原先永远失败。门禁只对**两条精确路径**
+> （`/dsh-market/restart`、`/dsh-market/api/v1/restart`）擦掉 `X-Forwarded-For` / `X-Real-IP` /
+> `Forwarded`，不动 Host / Origin。
+>
+> ⚠️ **这里绝不能用前缀 `/dsh-market/` 一把梭。** 市场把「重启 / 导出配置 / 自卸载」放在
+> **同一道严门**后面，而那些接口**不要求 DSH 会话**——它们的唯一访问控制就是这道门。
+> 用前缀放行的实测后果是：**只带门禁会话**就能下载 profile 配置（市场自己把
+> `pnpm-workspace.yaml` 列为「常含凭据」）、自卸载市场插件，把「门禁 + DSH 令牌」的
+> 双层模型压成一层。只列重启这两条即可（它们的唯一能力就是重启）。
+> 市场里「下载配置备份」「自卸载」两个按钮经门禁仍是 403，这是**有意保留**的。
+> 探针第 ⑦ 项就守着这条线。
 
 <img src="docs/admin.png" width="820" alt="dshai-gate 后台页：状态卡片 + 安全事件表">
 
@@ -242,7 +252,7 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 | 脚本 | 用途 |
 | --- | --- |
 | `scripts/selfcheck.sh` | 一键自检：容器健康、门禁是否拦住未授权、登录页是否正确、开放路由是否被挡、旧实例状态 |
-| `scripts/gate-probe.sh` | **门禁链路探针**：自签会话走完整链路，逐项验证插件接口 200、核心接口未受影响、未登录仍是 401、后台页与 `/gate` 短地址正常（**改过 `loopbackOnlyPrefixes` 或 `processControlPrefixes` 后必跑**；也可带一个公网 URL 参数，走 nginx 做全链路回归） |
+| `scripts/gate-probe.sh` | **门禁链路探针**：自签会话走完整链路，逐项验证插件接口 200、核心接口未受影响、未登录仍是 401、后台页与 `/gate` 短地址正常，另有 ⑥ X-Forwarded-For 信任方向、⑦ 市场围栏是否恢复（`/dsh-market/backup` 应 403、`/dsh-market/status` 应 200）。**改过 `loopbackOnlyPrefixes` / `processControlPaths` / `clientIP` 后必跑**；也可带一个公网 URL 参数，走 nginx 做全链路回归 |
 | `scripts/perm-guard.sh` | **起容器前必跑**：检查数据目录里有没有容器读不到的条目（否则 DSH 崩溃重启） |
 | `scripts/set-password.sh` | 设置 / 更换口令 |
 | `scripts/set-totp.sh` | 生成 TOTP 密钥；**先验证一次再写配置**，避免把自己锁在门外 |
@@ -254,7 +264,8 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 - **fail-closed**：没有任何认证配置时**拒绝启动**（宁可 502，也不留一扇没锁的门）
 - **只绑回环**：`GATE_LISTEN` 默认 `127.0.0.1`，不要改成 `0.0.0.0`
 - **密钥只从环境变量注入**：仓库与镜像里不含任何凭据；`.gitignore` 也挡掉了 `.env`、初始口令文件、数据目录
-- **不伪造请求头**：Host / Origin / Sec-Fetch-* **默认**一律原样透传，因此不存在 Cookie 归属漂移与重定向死循环。两处例外：`loopbackOnlyPrefixes` 列出的插件接口（只认回环身份，都是纯 API 请求，不涉及页面 Cookie 归属），以及 `processControlPrefixes`（`/dsh-market/`，只**擦掉** `X-Forwarded-For` / `X-Real-IP` / `Forwarded`，不改 Host / Origin）
+- **不伪造请求头**：Host / Origin / Sec-Fetch-* **默认**一律原样透传，因此不存在 Cookie 归属漂移与重定向死循环。两处例外：`loopbackOnlyPrefixes` 列出的插件接口（只认回环身份，都是纯 API 请求，不涉及页面 Cookie 归属；含 `.`/`..` 段的路径**不**给身份，因为上游会把它归一化成别的路径，等于给白名单开后门），以及 `processControlPaths`（只两条精确重启路径，只**擦掉** `X-Forwarded-For` / `X-Real-IP` / `Forwarded`，不改 Host / Origin）
+- **按 IP 防爆破只信最后一跳**：`clientIP()` 取 `X-Forwarded-For` 的**最后一个**非空值。上游 nginx 用 `$proxy_add_x_forwarded_for`，语义是「客户端自带值 + 真实 IP」；取第一个等于把攻击者随手写的字符串当成客户端身份，按 IP 锁定会被每次换个伪造值绕过
 - **不做多余的事**：不实现用户系统、不做 OAuth、不引入数据库 —— 一台机器一个人，够用即可
 
 ## 许可与致谢

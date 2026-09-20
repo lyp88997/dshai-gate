@@ -81,4 +81,30 @@ printf '  %-42s [%s] -> %s\n' "/gate 短地址（应 302 到后台页）" \
 printf '  %-42s %s 处\n' "登录页含可复制命令块" \
   "$(curl -s -H "Host: $HOSTHDR" -H 'Accept: text/html' "$GATE/__gate/login" | grep -c 'data-copy=')"
 
+echo "== ⑥ X-Forwarded-For 信任方向（防爆破「按 IP 锁定」依赖它）=="
+# 上游 nginx 用 $proxy_add_x_forwarded_for，语义是「客户端自带值 + 真实 IP」，
+# 即「不可信前缀 + 可信后缀」。门禁必须取最后一个；取第一个等于把攻击者
+# 随手写的字符串当成客户端身份，于是每次换个伪造值就能绕过按 IP 锁定。
+SPOOF=203.0.113.7; LAST=198.51.100.9
+curl -s -o /dev/null -H "Host: $HOSTHDR" -H "X-Forwarded-For: $SPOOF, $LAST" "$GATE/__gate/ipcheck"
+LINE=$(docker logs dshai-gate 2>&1 | grep '未鉴权拦截' | tail -1)
+case "$LINE" in
+  *"$LAST"*) printf '  %-42s ✓ 取到最后一跳 %s\n' "伪造 $SPOOF + 真实 $LAST" "$LAST";;
+  *"$SPOOF"*) printf '  %-42s ✗ 取了伪造的第一个值！\n' "伪造 $SPOOF + 真实 $LAST";;
+  *) printf '  %-42s ? 日志未命中：%s\n' "XFF 信任方向" "$LINE";;
+esac
+
+echo "== ⑦ 市场围栏是否恢复（只带门禁会话、不带 DSH 会话）=="
+# 1.5.1 曾用前缀 /dsh-market/ 擦转发头，结果只带门禁会话就能导出 profile 配置、
+# 自卸载市场插件（把「门禁 + DSH 令牌」压成一层）。1.5.3 收窄成只擦精确的重启
+# 路径后，这两个接口必须重新被市场自己的严门挡住（403）。
+BK=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOSTHDR" -b "$GATECOOKIE" \
+  -H "Origin: https://$HOSTHDR" "$GATE/dsh-market/backup")
+if [ "$BK" = "403" ]; then printf '  %-42s [%s] ✓ 需要 DSH 令牌\n' "/dsh-market/backup（应 403）" "$BK"
+else printf '  %-42s [%s] ✗ 围栏失效！\n' "/dsh-market/backup（应 403）" "$BK"; fi
+ST=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOSTHDR" -b "$GATECOOKIE" \
+  -H "Origin: https://$HOSTHDR" "$GATE/dsh-market/status")
+if [ "$ST" = "200" ]; then printf '  %-42s [%s] ✓ 市场未被整体挡住\n' "/dsh-market/status（应 200）" "$ST"
+else printf '  %-42s [%s] ✗ 市场不可达\n' "/dsh-market/status（应 200）" "$ST"; fi
+
 rm -f /tmp/probe.out /tmp/admin.out "$JAR"

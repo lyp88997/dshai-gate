@@ -48,7 +48,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.5.1"
+	gateVersion  = "1.5.3"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 	totpPeriod   = 30
@@ -128,12 +128,23 @@ func isHTTPS(r *http.Request) bool {
 	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
+// clientIP 取真实客户端 IP。
+//
+// ★ 必须取 X-Forwarded-For 的**最后一个**非空值，绝不能取第一个。
+//   上游 nginx 用的是 $proxy_add_x_forwarded_for，语义是「客户端自带的值 + 真实 IP」，
+//   也就是「不可信前缀 + 可信后缀」。取第一个 = 把攻击者随手写的字符串当成客户端身份，
+//   于是 noteFail / lockRemaining 的「按 IP 锁定」可以靠每次换一个伪造值绕过：
+//   2026-09-20 实测，同一个外部客户端伪造两个不同 IP，门禁日志记成两条「第 1 次」，
+//   永远累加不到 5 次锁定，只剩全局限流（且会按伪造 IP 分桶、把真实记录挤出环形缓冲）。
+//   取最后一个 = 取最近一跳可信代理看到的地址，那才是可信的那一个。
 func clientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i > 0 {
-			return strings.TrimSpace(xff[:i])
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			if ip := strings.TrimSpace(parts[i]); ip != "" {
+				return ip
+			}
 		}
-		return strings.TrimSpace(xff)
 	}
 	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return h
@@ -908,8 +919,32 @@ func waitDSHRestart() string {
 	return "DSH 已停止，但 300 秒内没起来 —— 检查容器重启策略是否为 unless-stopped"
 }
 
+// sameOriginRequest 判定请求是否同源。
+//
+// 优先看 Sec-Fetch-Site（现代浏览器对同源请求必带 same-origin，跨站表单是 cross-site），
+// 没有该头时退回比对 Origin 的 authority 与 Host。
+//
+// ⚠️ 「没有 Origin 就放行」是**安全**的：按 Fetch 规范，跨站 POST 一定会带 Origin，
+// 所以「没有 Origin」不可能是一次跨站表单提交。反过来若要求必须有 Origin，
+// 会把某些浏览器上同源表单导航不带 Origin 的情况一起误杀，那是可用性事故。
+func sameOriginRequest(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "same-origin", "none":
+		return true
+	case "same-site", "cross-site":
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host == r.Host
+}
+
 // handleRestart 后台页的重启按钮（withGate 已保证只有已登录会话能到这里）。
-// POST + SameSite=Lax 的会话 Cookie ⇒ 跨站表单带不上 Cookie，天然免 CSRF。
+// 会话 Cookie 是 SameSite=Lax，跨站表单本来就带不上；同源校验是纵深防御，
+// 也让这条路由不比它所替代的市场路由更松。
 func handleRestart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -917,6 +952,12 @@ func handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := clientIP(r)
+	if !sameOriginRequest(r) {
+		secNote("重启 DSH", ip, "非同一站点，已拒绝（Sec-Fetch-Site=%q Origin=%q Host=%q）",
+			r.Header.Get("Sec-Fetch-Site"), r.Header.Get("Origin"), r.Host)
+		http.Error(w, "只接受同源请求", http.StatusForbidden)
+		return
+	}
 	restartState.mu.Lock()
 	if restartState.running {
 		restartState.mu.Unlock()
@@ -1035,25 +1076,44 @@ func loopbackOnlyPath(path string) bool {
 	return false
 }
 
-// processControlPrefixes 列出「拒绝一切转发痕迹」的市场接口前缀。
+// processControlPaths 列出「拒绝一切转发痕迹」的市场路由（**精确匹配**）。
 //
-// 插件市场（dshmarket）的重启与自卸载路由用 trustedRestartRequest 判定：
-// 对端是回环、且**完全没有** Forwarded / X-Forwarded-For / X-Real-IP 任一痕迹、
-// 且 Origin 的 authority 等于 Host —— 三者齐备才放行。它把「有转发头」直接
-// 等同于「来的是代理，不是本人」，这是有意为之的安全设计。
+// 插件市场（dshmarket）的重启路由用 trustedRestartRequest 判定：对端是回环、
+// 且**完全没有** Forwarded / X-Forwarded-For / X-Real-IP 任一痕迹、且 Origin 的
+// authority 等于 Host —— 三者齐备才放行。它把「有转发头」直接等同于「来的是代理，
+// 不是本人」，这是有意为之的安全设计。
 //
 // 而 Go 反代的 SetXForwarded() 对每个上游请求都必然补上 X-Forwarded-For，
 // 于是市场里的「立即重启」按钮经门禁永远失败（实测 403
 // "restart is limited to same-origin loopback requests"；去掉这一个头即放行，
 // 因为 Host 与 Origin 本就相等、对端本就是回环）。
 //
-// 门禁本身就是那道已完成鉴权的回环入口，与 loopbackOnlyPrefixes 同理：
-// 经它转发即代表身份可信。这里只擦转发头，不动 Host / Origin。
-var processControlPrefixes = []string{"/dsh-market/"}
+// ★ 只列重启这一条，**绝不能用前缀 "/dsh-market/" 一把梭**。
+//   市场把「重启 / 导出配置 / 自卸载」放在同一道严门后面，而市场那些接口
+//   **不要求 DSH 会话**——它们的唯一访问控制就是这道门。用前缀放行的实测后果是：
+//   只带门禁会话就能下载 profile 配置（含凭据线索）、自卸载市场插件，
+//   把「门禁 + DSH 令牌」的双层模型压成一层。
+//   重启这两条路径的唯一能力就是「重启」，放行它们不扩大任何权限。
+var processControlPaths = map[string]bool{
+	"/dsh-market/restart":        true, // 市场横幅「立即重启」按钮走这条
+	"/dsh-market/api/v1/restart": true, // v1 别名，内部 invokeLegacy 复用同一个 handler
+}
 
 func processControlPath(path string) bool {
-	for _, prefix := range processControlPrefixes {
-		if strings.HasPrefix(path, prefix) {
+	return processControlPaths[path]
+}
+
+// hasDotSegment 报告路径里是否含 "." 或 ".." 段。
+//
+// 为什么必须查它：门禁的前缀判定看的是**解码后**的路径，而上游收到的是**原始编码**
+// 路径并会自行归一化（实测 DSH 把 /api/task-board/%2e%2e/%2e%2e/dsh-market/backup
+// 归一化成 /dsh-market/backup）。两者不一致就等于给「回环身份白名单」开了后门：
+// 一个解码后以某白名单前缀开头的路径，落地却可以是任意别的上游路径。
+// 含点段的路径本来就不是合法插件接口，直接不给回环身份（请求照常转发，
+// 由插件自己的围栏去拒），比事后补救简单。
+func hasDotSegment(path string) bool {
+	for _, seg := range strings.Split(path, "/") {
+		if seg == "." || seg == ".." {
 			return true
 		}
 	}
@@ -1072,16 +1132,18 @@ func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
 			// ★ 仅回环类接口：向上游呈现回环身份（Host + Origin 同步），
 			//   否则插件自身的 loopback-only 围栏会拒绝经反代来的合法请求。
 			//   其余路径一律保持原 Host，避免影响 DSH 的 Cookie 归属与信任校验。
-			if loopbackOnlyPath(pr.In.URL.Path) {
+			//   含 "." / ".." 段的路径不给身份：它会与上游归一化后的落地路径不一致，
+			//   等于给白名单开后门（见 hasDotSegment 注释）。
+			if loopbackOnlyPath(pr.In.URL.Path) && !hasDotSegment(pr.In.URL.Path) {
 				pr.Out.Host = target.Host
 				if pr.In.Header.Get("Origin") != "" {
 					pr.Out.Header.Set("Origin", "http://"+target.Host)
 				}
 			}
 			pr.SetXForwarded()
-			// ★ 市场进程控制类接口：擦掉转发痕迹。市场自己那道「无转发头 =
-			//   本机直连」的严门会把经门禁来的合法请求一律 403（重启按钮失效）。
-			//   上游根本不读这几个头，擦掉无副作用。
+			// ★ 市场重启路由：擦掉转发痕迹。市场自己那道「无转发头 = 本机直连」
+			//   的严门会把经门禁来的合法请求一律 403（重启按钮失效）。
+			//   只对精确的重启路径生效，不动其它市场路由（见 processControlPaths 注释）。
 			if processControlPath(pr.In.URL.Path) {
 				pr.Out.Header.Del("X-Forwarded-For")
 				pr.Out.Header.Del("X-Real-IP")
