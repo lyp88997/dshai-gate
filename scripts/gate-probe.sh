@@ -107,4 +107,31 @@ ST=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOSTHDR" -b "$GATECOOKIE"
 if [ "$ST" = "200" ]; then printf '  %-42s [%s] ✓ 市场未被整体挡住\n' "/dsh-market/status（应 200）" "$ST"
 else printf '  %-42s [%s] ✗ 市场不可达\n' "/dsh-market/status（应 200）" "$ST"; fi
 
+echo "== ⑧ 市场变更路由是否放行（修复目标：不再 403 untrusted origin）=="
+# dshmarket 1.56.0 起 sameOrigin 要求 Host 必须是回环，经域名一律 403
+# "untrusted origin"，安装/卸载/更新/启停全部失效。门禁对 marketMutationPaths
+# 列出的精确路由呈现回环身份后，这些接口应落到**业务错误**而不是 403。
+for p in /dsh-market/uninstall /dsh-market/toggle /dsh-market/update; do
+  C=$(post "$p")
+  if [ "$C" = "403" ] && grep -q 'untrusted origin' /tmp/probe.out; then
+    printf '  %-42s [%s] ✗ 仍被市场围栏挡住\n' "POST $p" "$C"
+  else
+    printf '  %-42s [%s] ✓ %s\n' "POST $p" "$C" "$(head -c 44 /tmp/probe.out)"
+  fi
+done
+
+echo "== ⑨ 排除清单必须仍被挡（这些接口不需要 DSH 会话）=="
+# ★ 这几个接口**不带任何 DSH 会话**就能拿到 profile 配置 / 卸载市场，
+#   它们唯一的门就是 trustedDownloadRequest / sameOrigin。门禁绝不能给它们回环身份。
+#   /dsh-market/restart 不要放进探针：它会真的重启 DSH。
+C=$(get /dsh-market/backup)
+if [ "$C" = "403" ]; then printf '  %-42s [%s] ✓ 保持拒绝\n' "GET /dsh-market/backup（应 403）" "$C"
+else printf '  %-42s [%s] ✗ 围栏失效！\n' "GET /dsh-market/backup（应 403）" "$C"; fi
+C=$(post /dsh-market/self-uninstall)
+if [ "$C" = "403" ]; then printf '  %-42s [%s] ✓ 保持拒绝\n' "POST /dsh-market/self-uninstall（应 403）" "$C"
+else printf '  %-42s [%s] ✗ 围栏失效！\n' "POST /dsh-market/self-uninstall（应 403）" "$C"; fi
+# 已知上游缺口（非门禁引入，实测改动前后都是 200）：/dsh-market/logs 在 dshmarket
+# 里**没有任何围栏**，只带门禁会话即可读到（内容由市场自身脱敏）。仅记录事实。
+printf '  %-42s [%s] 上游未设防（已知，与门禁无关）\n' "GET /dsh-market/logs（上游无围栏）" "$(get /dsh-market/logs)"
+
 rm -f /tmp/probe.out /tmp/admin.out "$JAR"

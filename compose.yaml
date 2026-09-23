@@ -11,8 +11,17 @@ services:
     restart: unless-stopped
     init: true
     network_mode: host
-    mem_limit: 800m
-    memswap_limit: 1300m
+    # ★ 下限 1400m，勿降。两层依据（均实测）：
+    #   ① Node 的 JS 堆上限 = 容器内存限额÷2 + 96MB
+    #      （1200m→696MB、飞牛 1500m→846MB；据此 800m 仅约 496MB）。
+    #   ② 硬需求 1358MB = DSH 本体 966MB + univer-office 网关 392MB。
+    #      1200m 时超出部分被换进交换文件（memory.swap.current=622MB）；1400m 才装得下。
+    #   主机共 1974MB、宿主自身约需 350MB —— 1400m 已接近这台机器上限，不要再加。
+    mem_limit: 1400m
+    memswap_limit: 2400m
+    # 崩溃转储会落到工作目录（core_pattern=core），一次 1.5GB，直接关掉
+    ulimits:
+      core: 0
     environment:
       - NODE_ENV=production
       - SSH_CONNECTION=127.0.0.1 0 127.0.0.1 22
@@ -34,7 +43,7 @@ services:
 
   gate:
     build: ./gate
-    image: dsh-gate:1.5.3
+    image: dsh-gate:1.5.4
     container_name: dshai-gate
     restart: unless-stopped
     network_mode: host

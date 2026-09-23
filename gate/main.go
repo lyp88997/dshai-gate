@@ -48,7 +48,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.5.3"
+	gateVersion  = "1.5.4"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 	totpPeriod   = 30
@@ -1076,6 +1076,52 @@ func loopbackOnlyPath(path string) bool {
 	return false
 }
 
+// marketMutationPaths 列出「需要回环身份」的市场变更路由（**精确匹配**）。
+//
+// 背景：dshmarket 1.56.0（上游 commit 9be13bf，修 #678 DNS rebinding）给
+// sameOrigin 加了 loopbackAuthority(host)：Host 必须是 127.0.0.1 / localhost /
+// [::1]。1.55.0 只比对 Origin==Host，所以经门禁（Host 为域名）本来是放行的；
+// 1.56.0 起，市场的全部写操作经反代一律 403 "untrusted origin"。
+//
+// ★ 为什么用精确匹配，而不是往 loopbackOnlyPrefixes 加 "/dsh-market/"：
+//   实测 /dsh-market/backup 与 /dsh-market/logs **不带任何 DSH 会话**就能拿到
+//   profile 配置与日志 —— 它们唯一的门就是 sameOrigin。用前缀一把梭等于把
+//   「门禁 + DSH 令牌」压成一层（同 1.5.1 的教训）。这里只列「唯一能力就是
+//   管理插件」的路由。
+//
+// 刻意排除（仍由市场自己的围栏挡住，经门禁保持 403）：
+//
+//	/dsh-market/backup、/restore、/restore-snapshot、/delete-snapshot、
+//	/snapshots、/rollback、/gist、/webdav、/logs、/self-uninstall
+var marketMutationPaths = map[string]bool{
+	// 插件安装 / 卸载 / 更新 / 启停
+	"/dsh-market/install":   true,
+	"/dsh-market/uninstall": true,
+	"/dsh-market/update":    true,
+	"/dsh-market/toggle":    true,
+	"/dsh-market/cancel":    true,
+	// 安装源与构建授权
+	"/dsh-market/migrate-source": true,
+	"/dsh-market/approve-builds": true,
+	"/dsh-market/setup-pnpm":     true,
+	// 市场自身偏好（纯 UI 状态，不含凭据）
+	"/dsh-market/channel":                 true,
+	"/dsh-market/region":                  true,
+	"/dsh-market/favorite":                true,
+	"/dsh-market/note":                    true,
+	"/dsh-market/groups":                  true,
+	"/dsh-market/presets":                 true,
+	"/dsh-market/bundle-order":            true,
+	"/dsh-market/use-skin":                true,
+	"/dsh-market/github-proxy":            true,
+	"/dsh-market/discovery-compatibility": true,
+	// 更新 API v1（/api/v1/restart 见 processControlPaths）
+	"/dsh-market/api/v1/updates":  true,
+	"/dsh-market/api/v1/rollback": true,
+}
+
+func marketMutationPath(path string) bool { return marketMutationPaths[path] }
+
 // processControlPaths 列出「拒绝一切转发痕迹」的市场路由（**精确匹配**）。
 //
 // 插件市场（dshmarket）的重启路由用 trustedRestartRequest 判定：对端是回环、
@@ -1129,12 +1175,15 @@ func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
 			// ★ 关键：SetURL 会把 Host 改成上游地址，必须改回原域名，
 			//   否则 DSH 的 --trusted-host 校验失败，特权接口全部 403
 			pr.Out.Host = pr.In.Host
-			// ★ 仅回环类接口：向上游呈现回环身份（Host + Origin 同步），
+			// ★ 仅回环类接口 + 市场变更路由（见 marketMutationPaths）+ 重启路由：
+			//   向上游呈现回环身份（Host + Origin 同步），
 			//   否则插件自身的 loopback-only 围栏会拒绝经反代来的合法请求。
 			//   其余路径一律保持原 Host，避免影响 DSH 的 Cookie 归属与信任校验。
 			//   含 "." / ".." 段的路径不给身份：它会与上游归一化后的落地路径不一致，
 			//   等于给白名单开后门（见 hasDotSegment 注释）。
-			if loopbackOnlyPath(pr.In.URL.Path) && !hasDotSegment(pr.In.URL.Path) {
+			// path 取一次：回环身份判定与转发头擦除共用。
+			path := pr.In.URL.Path
+			if (loopbackOnlyPath(path) || marketMutationPath(path) || processControlPath(path)) && !hasDotSegment(path) {
 				pr.Out.Host = target.Host
 				if pr.In.Header.Get("Origin") != "" {
 					pr.Out.Header.Set("Origin", "http://"+target.Host)
@@ -1144,7 +1193,9 @@ func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
 			// ★ 市场重启路由：擦掉转发痕迹。市场自己那道「无转发头 = 本机直连」
 			//   的严门会把经门禁来的合法请求一律 403（重启按钮失效）。
 			//   只对精确的重启路径生效，不动其它市场路由（见 processControlPaths 注释）。
-			if processControlPath(pr.In.URL.Path) {
+			//   注意：trustedRestartRequest 除了要求「无转发头」还要求 Host 是回环，
+			//   所以上面那一步也必须把这两条路径算进回环身份，否则经域名进来仍是 403。
+			if processControlPath(path) {
 				pr.Out.Header.Del("X-Forwarded-For")
 				pr.Out.Header.Del("X-Real-IP")
 				pr.Out.Header.Del("Forwarded")
