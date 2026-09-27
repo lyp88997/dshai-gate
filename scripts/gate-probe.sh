@@ -7,7 +7,10 @@ set -eu
 ENVF=/opt/dshai/.env
 GATE=${1:-http://127.0.0.1:2299}
 DSH=http://127.0.0.1:3082
-HOSTHDR="dsh.example.com"
+# Host 头必须落在 DSH 的 --trusted-host 名单里（也决定 nginx 选哪个 vhost），
+# 所以从 .env 的 DSH_TRUSTED_HOST 取，而不是写死占位域名。
+HOSTHDR=$(grep -m1 '^DSH_TRUSTED_HOST=' "$ENVF" 2>/dev/null | cut -d= -f2- || true)
+[ -n "${HOSTHDR:-}" ] || HOSTHDR="dsh.example.com"
 JAR=/tmp/dsh.jar
 
 # 1) 自签门禁会话 Cookie

@@ -42,10 +42,13 @@ echo "✅ 动态码验证通过"
 umask 077
 S=$(grep -m1 '^GATE_SESSION_SECRET=' "$ENV" 2>/dev/null | cut -d= -f2- || true)
 [ -n "${S:-}" ] || S=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-{
+# 只替换这两把密钥，保留 .env 里其它配置（例如 DSH_TRUSTED_HOST），避免静默丢配置
+TMP=$(mktemp)
+{ grep -vE '^(GATE_SESSION_SECRET|GATE_TOTP_SECRET)=' "$ENV" 2>/dev/null || true
   echo "GATE_SESSION_SECRET=$S"
   echo "GATE_TOTP_SECRET=$SEC"
-} > "$ENV"
+} > "$TMP"
+mv "$TMP" "$ENV"
 chmod 600 "$ENV"
 echo "已写入 $ENV（TOTP 单因子模式，已移除口令）"
 echo

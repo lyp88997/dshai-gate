@@ -1038,6 +1038,14 @@ func withGate(next http.Handler) http.Handler {
 				handleRestart(w, r)
 				return
 			}
+			// ★ 远端执行接口的第二层：它自带 loopback 围栏但不校验 DSH 会话，
+			//   仅凭门禁 Cookie 就能在用户所有主机上执行命令。这里用浏览器带来的
+			//   Cookie 探一次 DSH，没有有效会话即拒（fail-closed）。
+			if dshSSHPath(r.URL.Path) && !dshHasSession(r) {
+				secNote("远端执行接口缺 DSH 会话", clientIP(r), "%s %s", r.Method, r.URL.Path)
+				http.Error(w, "需要有效的 DSH 会话", http.StatusForbidden)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1053,6 +1061,14 @@ func withGate(next http.Handler) http.Handler {
 	})
 }
 
+// dshSSHPrefix 是「远端执行」接口族：这些接口会在用户配置的远端主机上执行命令。
+// 它自己带 loopback-only 围栏（见 loopbackOnlyPrefixes），但**不校验 DSH 会话**；
+// 只放行回环身份就等于把「门禁 + DSH 令牌」压成一层，所以 withGate 另加第二层。
+const dshSSHPrefix = "/api/dsh-ssh/"
+
+// dshSSHPath 报告路径是否属于远端执行接口族。
+func dshSSHPath(path string) bool { return strings.HasPrefix(path, dshSSHPrefix) }
+
 // loopbackOnlyPrefixes 列出「仅回环同源」类插件接口的前缀。
 // 这些插件把接口围栏为 loopback-only：Host 必须是 127.0.0.1/localhost 且
 // Origin 与之相等，DSH 的 --trusted-host 对这类围栏不生效，于是经反代访问
@@ -1063,6 +1079,7 @@ var loopbackOnlyPrefixes = []string{
 	"/api/task-board/",
 	"/api/dsh-skill-explorer/",
 	"/api/dsh-provider-usage/",
+	dshSSHPrefix,
 	"/modlens/",
 	"/modsearch/",
 }

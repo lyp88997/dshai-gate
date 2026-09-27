@@ -5,8 +5,8 @@ services:
     build:
       context: .
       args:
-        DSH_VERSION: "0.1.5-rc.1"
-    image: dsh-official:0.1.5-rc.1
+        DSH_VERSION: "0.1.5-rc.3"
+    image: dsh-official:0.1.5-rc.3
     container_name: dshai-web
     restart: unless-stopped
     init: true
@@ -25,15 +25,20 @@ services:
     environment:
       - NODE_ENV=production
       - SSH_CONNECTION=127.0.0.1 0 127.0.0.1 22
-      - DSH_WEB_URL=https://dsh.example.com
+      - DSH_WEB_URL=https://${DSH_TRUSTED_HOST:-dsh.example.com}
     volumes:
       - ./data:/home/node/.dsh
       - ./workspaces:/home/node/workspaces
       - ./home:/home/node
       - ./plugins:/home/node/plugins:ro
     command: ["web", "--no-open", "--port", "3082",
-              "--trusted-host", "dsh.example.com",
-              "--trusted-host", "dsh.example.com:443"]
+              "--trusted-host", "${DSH_TRUSTED_HOST:-dsh.example.com}",
+              "--trusted-host", "${DSH_TRUSTED_HOST:-dsh.example.com}:443"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3082/manifest.webmanifest').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
@@ -56,5 +61,10 @@ services:
       - GATE_PASSWORD_HASH=${GATE_PASSWORD_HASH}
       - GATE_TOTP_SECRET=${GATE_TOTP_SECRET}
       - GATE_SESSION_SECRET=${GATE_SESSION_SECRET}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       - dsh

@@ -1,8 +1,8 @@
-# DSH official npm package, pinned version —— 与飞牛实例(0.1.5-rc.1)保持一致
+# DSH official npm package, pinned version —— 本实例钉 0.1.5-rc.3
 # 配方继承自 /opt/dsh/Dockerfile（旧实例，生产验证过）
 FROM node:24-slim
 
-ARG DSH_VERSION=0.1.5-rc.1
+ARG DSH_VERSION=0.1.5-rc.3
 
 # git/procps/python3/make/g++：DSH 常调外部命令；openssh-client：dsh-ssh 插件备用
 RUN apt-get update \
