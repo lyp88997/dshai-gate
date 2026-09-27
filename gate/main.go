@@ -1335,7 +1335,12 @@ func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
 				sessionExpiredResponse(resp, orig)
 				return nil
 			}
-			if resp.Body != nil {
+			// ★ 101（WebSocket / h2c 升级）的响应体是**双向连接**：httputil 在
+			//   handleUpgradeResponse 里会断言 io.ReadWriteCloser（reverseproxy.go:748）。
+			//   包装它等于丢掉这个接口，升级请求被打成 502
+			//   "internal error: 101 switching protocols response with non-writable body"
+			//   ——2026-09-27 部署 1.6.0 后在生产的 GET /api/remote.mux 上实测到。
+			if resp.Body != nil && resp.StatusCode != http.StatusSwitchingProtocols {
 				resp.Body = &attribBody{rc: resp.Body, orig: orig}
 			}
 			ct := strings.ToLower(resp.Header.Get("Content-Type"))
