@@ -137,4 +137,28 @@ else printf '  %-42s [%s] ✗ 围栏失效！\n' "POST /dsh-market/self-uninstal
 # 里**没有任何围栏**，只带门禁会话即可读到（内容由市场自身脱敏）。仅记录事实。
 printf '  %-42s [%s] 上游未设防（已知，与门禁无关）\n' "GET /dsh-market/logs（上游无围栏）" "$(get /dsh-market/logs)"
 
-rm -f /tmp/probe.out /tmp/admin.out "$JAR"
+echo "== ⑩ DSH 会话失效时的恢复路径（只带门禁会话）=="
+# 场景：门禁会话（30 天）还有效，DSH 自己那层已经失效（DSH 重启 / 轮换 / 各自过期）。
+# 修复前 DSH 的裸 401 被原样透传，浏览器看到的是 DSH 自己的
+# 「dsh web authentication required; reopen the URL printed by dsh web.」——
+# 没有任何登录页可进，只能手工敲 /__gate/login（2026-09-27 在生产实测复现）。
+# 修复后：文档导航就地换上门禁登录页；XHR 仍拿 401 原文，
+# 因为把 HTML 喂给 JSON 解析器会把 SPA 弄成更难查的错误态。
+NAVCODE=$(curl -s -o /tmp/expire.out -w '%{http_code}' -H "Host: $HOSTHDR" \
+  -b "$GATECOOKIE" -H 'Accept: text/html' -H 'Sec-Fetch-Mode: navigate' "$GATE/")
+if [ "$NAVCODE" = "401" ] && grep -q 'action="/__gate/login"' /tmp/expire.out; then
+  printf '  %-42s [%s] ✓ 已换成门禁登录页\n' "仅门禁会话 + 导航 GET /" "$NAVCODE"
+else
+  printf '  %-42s [%s] ✗ 未回登录页（DSH 裸 401 被透传？）\n' "仅门禁会话 + 导航 GET /" "$NAVCODE"
+fi
+printf '  %-42s %s 处（应为 1）\n' "登录页含 DSH 令牌输入框" "$(grep -c 'name="dstoken"' /tmp/expire.out)"
+XRCODE=$(curl -s -o /tmp/expire.out -w '%{http_code}' -H "Host: $HOSTHDR" \
+  -b "$GATECOOKIE" -H 'Accept: application/json' "$GATE/")
+if [ "$XRCODE" = "401" ] && ! grep -q '__gate/login' /tmp/expire.out; then
+  printf '  %-42s [%s] ✓ 仍是 401 原文（未被换成 HTML）\n' "仅门禁会话 + XHR GET /" "$XRCODE"
+else
+  printf '  %-42s [%s] ✗ XHR 被换成了登录页\n' "仅门禁会话 + XHR GET /" "$XRCODE"
+fi
+printf '  %-42s [%s] 对照（两个会话都在时应 200）\n' "双 Cookie GET /" "$(get /)"
+
+rm -f /tmp/probe.out /tmp/admin.out /tmp/expire.out "$JAR"

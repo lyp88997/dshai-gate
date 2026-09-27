@@ -15,6 +15,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -37,6 +38,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	// ★ 内嵌 IANA 时区库（标准库自带，不引入第三方依赖）。
+	//   gate 镜像基于 alpine:3.20，里面没有 zoneinfo；发布产物又是脱离容器的单二进制。
+	//   不内嵌的话 TZ=Asia/Shanghai 会被静默忽略，日志与后台页时间比本地时间早 8 小时
+	//   （2026-09-27 实测：宿主 18:45:35 CST 而容器 10:45:35 UTC）。
+	_ "time/tzdata"
 )
 
 //go:embed login.html
@@ -48,7 +54,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.5.4"
+	gateVersion  = "1.6.0"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 	totpPeriod   = 30
@@ -478,18 +484,32 @@ func tipOf() string {
 	return "受口令保护 · 仅限本人使用"
 }
 
+// newLoginView 组装登录页数据（口令/动态码/令牌三块由全局配置与探测结果决定）
+func newLoginView(errMsg string, locked bool, remain time.Duration, next string, hasSession bool) loginView {
+	return loginView{
+		Title: siteTitle, Subtitle: subtitleOf(), Tip: tipOf(),
+		Next: sanitizeNext(next), Error: errMsg, Locked: locked,
+		Remain: humanDur(remain), NeedPassword: needPw, NeedTOTP: needTotp,
+		HasSession: hasSession, TokenNeeded: !hasSession,
+	}
+}
+
+// loginBytes 渲染登录页。抽出来是为了让「上游 401 就地换成登录页」复用同一份模板，
+// 避免出现第二处 template.Execute（见 sessionExpiredResponse）。
+func loginBytes(v loginView) []byte {
+	var b bytes.Buffer
+	_ = loginTpl.Execute(&b, v)
+	return b.Bytes()
+}
+
 func renderLogin(w http.ResponseWriter, status int, errMsg string, locked bool, remain time.Duration, next string, hasSession bool) {
+	body := loginBytes(newLoginView(errMsg, locked, remain, next, hasSession))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.WriteHeader(status)
-	_ = loginTpl.Execute(w, loginView{
-		Title: siteTitle, Subtitle: subtitleOf(), Tip: tipOf(),
-		Next: sanitizeNext(next), Error: errMsg, Locked: locked,
-		Remain: humanDur(remain), NeedPassword: needPw, NeedTOTP: needTotp,
-		HasSession: hasSession, TokenNeeded: !hasSession,
-	})
+	_, _ = w.Write(body)
 }
 
 func wantsHTML(r *http.Request) bool {
@@ -1185,8 +1205,90 @@ func hasDotSegment(path string) bool {
 
 // ---------- 反代 ----------
 
+// ★ Directive：Rewrite / ModifyResponse / ErrorHandler 拿到的都是**出站请求**
+// （Rewrite 的 pr.Out，另两处的 resp.Request / r 也都是它）。出站请求上
+// pr.SetXForwarded() 已经把入站 RemoteAddr（也就是 nginx 的 127.0.0.1）追加到
+// X-Forwarded-For 末尾，于是 clientIP() 取「最后一跳」必然拿到 127.0.0.1：
+//
+//	2026-09-27 实测 docker logs dshai-gate 的 41 条「上游错误」100% 记成
+//	ip=127.0.0.1，而同机由 withGate 记录的「未鉴权拦截」（入站请求）拿到的是
+//	真实 IP 202.107.251.210 —— 差别只在于用的哪个请求。
+//
+// 所以在 Rewrite 里把 pr.In 存进出站请求的 context，下游统一用 origRequest 取回。
+type origReqKey struct{}
+
+// origRequest 取回入站（浏览器原始）请求；取不到就退回传进来的请求。
+func origRequest(r *http.Request) *http.Request {
+	if r != nil {
+		if v, ok := r.Context().Value(origReqKey{}).(*http.Request); ok && v != nil {
+			return v
+		}
+	}
+	return r
+}
+
+// attribBody 包装上游响应体，把「复制响应体时被截断」这个错误带上归因再记录。
+//
+// 为什么必须自己包装：这条错误由 stdlib reverseproxy.go:650 的 p.logf 直接输出，
+//
+//	httputil: ReverseProxy read error during body copy: unexpected EOF
+//
+// 只有错误文本，没有 IP、没有路径（2026-09-27 实测 25 小时 32 条，全部无归属，
+// 且严格成对出现、每个时间点都紧贴 DSH 停机 —— 是 DSH 断开时截断两条常驻流的产物）。
+// 把 ErrorLog 指向 io.Discard 免得同一条被记两遍；Go 1.23 里 logf 只剩三个调用点：
+// reverseproxy.go:307（defaultErrorHandler，已被我们的 ErrorHandler 取代）、
+// :527（仅测试环境）、:650（就是这一条）—— 所以丢掉的只有重复行。
+type attribBody struct {
+	rc   io.ReadCloser
+	orig *http.Request
+}
+
+func (b *attribBody) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	if err != nil && err != io.EOF && err != context.Canceled {
+		secNote("响应流中断", clientIP(b.orig), "%s %s: %v", b.orig.Method, b.orig.URL.Path, err)
+	}
+	return n, err
+}
+
+func (b *attribBody) Close() error { return b.rc.Close() }
+
+// sessionExpiredResponse 把上游的裸 401 就地换成门禁登录页。
+//
+// 这是「门禁会话还有效、DSH 那层已经失效」的恢复路径：withGate 只凭门禁 Cookie
+// 放行，DSH 回的 401 以前原样透传，浏览器看到的是 DSH 自己的
+// `dsh web authentication required; reopen the URL printed by dsh web.`，
+// 没有任何登录页可进（2026-09-27 在生产实测复现）。两边 Cookie 一起被清的情况
+// 本来就会落到 withGate 的未鉴权分支，不经过这里。
+func sessionExpiredResponse(resp *http.Response, orig *http.Request) {
+	body := loginBytes(newLoginView("", false, 0, orig.URL.RequestURI(), false))
+	secNote("DSH 会话失效", clientIP(orig), "%s %s", orig.Method, orig.URL.Path)
+
+	_ = resp.Body.Close() // 401 体一律丢弃
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Status = fmt.Sprintf("%d %s", http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized))
+
+	h := resp.Header
+	// ★ 必须删：否则浏览器弹原生用户名/口令框，盖在登录页上
+	h.Del("WWW-Authenticate")
+	// ★ 必须删：DSH 若下发严格 CSP，登录页的内联 <style>/<script>
+	//   与 data: URI favicon（gate/login.html 首行）会被直接挡掉 —— 页面无样式、复制按钮失效
+	h.Del("Content-Security-Policy")
+	h.Del("Content-Security-Policy-Report-Only")
+	h.Del("Content-Encoding")
+	h.Del("Content-Range")
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	h.Set("Cache-Control", "no-store")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("Referrer-Policy", "no-referrer")
+	// 上游 401 上的 Set-Cookie 保留透传（DSH 顺手清自己的 Cookie 是它该做的事）
+}
+
 func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
+		ErrorLog: log.New(io.Discard, "", 0), // 见 attribBody 注释
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			// ★ 关键：SetURL 会把 Host 改成上游地址，必须改回原域名，
@@ -1219,8 +1321,23 @@ func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
 			}
 			// ★ 必须禁用上游压缩，否则响应体是 gzip，注入静默失效
 			pr.Out.Header.Set("Accept-Encoding", "identity")
+			// ★ 把入站请求存进出站请求的 context：ModifyResponse / ErrorHandler
+			//   只能拿到出站请求，而 clientIP 必须用入站那个（见 origReqKey 注释）。
+			pr.Out = pr.Out.WithContext(context.WithValue(pr.Out.Context(), origReqKey{}, pr.In))
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			orig := origRequest(resp.Request)
+			// ★ 会话失效检测：只拦「文档导航 + 上游 401 + 复核确认没有 DSH 会话」。
+			//   复核（dshHasSession）让这成为精确触发器而不是启发式：某条插件路由
+			//   对合法会话回 401 时探测得 200，于是不拦、保持原样。
+			//   XHR / SSE / 静态资源被 wantsHTML 挡住，不会拿到 HTML 体。
+			if resp.StatusCode == http.StatusUnauthorized && wantsHTML(orig) && !dshHasSession(orig) {
+				sessionExpiredResponse(resp, orig)
+				return nil
+			}
+			if resp.Body != nil {
+				resp.Body = &attribBody{rc: resp.Body, orig: orig}
+			}
 			ct := strings.ToLower(resp.Header.Get("Content-Type"))
 			if strings.HasPrefix(ct, "text/event-stream") {
 				resp.Header.Set("Cache-Control", "no-cache, no-transform")
@@ -1252,7 +1369,10 @@ func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			secNote("上游错误", clientIP(r), "%s %s: %v", r.Method, r.URL.Path, err)
+			// ★ 必须用入站请求：r 是出站请求，其 XFF 末尾是 nginx 的 127.0.0.1，
+			//   直接 clientIP(r) 会让所有上游错误都记在同一个 IP 上（见 origReqKey 注释）。
+			orig := origRequest(r)
+			secNote("上游错误", clientIP(orig), "%s %s: %v", orig.Method, orig.URL.Path, err)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte(`<meta charset="utf-8"><h3>DSH 暂不可达</h3>` +
@@ -1307,8 +1427,8 @@ func main() {
 	}
 	upstreamURL = target
 
-	secNote("启动", "-", "v%s 监听 %s → %s（%s，会话=%d 天，注入=%v）",
-		gateVersion, listen, target, subtitleOf(), sessionDs, inject)
+	secNote("启动", "-", "v%s 监听 %s → %s（%s，会话=%d 天，注入=%v，时区=%s）",
+		gateVersion, listen, target, subtitleOf(), sessionDs, inject, time.Local.String())
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           withGate(newProxy(target, inject)),

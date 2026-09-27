@@ -145,6 +145,20 @@ location / {
 
 每次失败都会记录来源 IP 与剩余可尝试次数。
 
+### 会话失效时会怎样
+
+门禁会话（默认 30 天）和 DSH 自己的会话是**两个独立时钟**，谁短谁先死：
+
+| 情况 | 行为 |
+| --- | --- |
+| 浏览器清掉了 Cookie / 站点数据 | 两个 Cookie 一起消失 → 直接回登录页，且「DSH 令牌」框**自动变必填** |
+| 只清了缓存、Cookie 还在 | 无影响 |
+| **门禁会话还在、DSH 会话已失效**（DSH 重启 / 轮换 / 各自过期） | 打开页面时若上游回 **401**，门禁**就地**把文档导航换成登录页（不是重定向，URL 与 `next` 保持原样）；XHR / SSE 仍拿 401 原文，不会被塞进 HTML |
+| 会话在**页面已经开着**时失效 | 标签页里的请求继续 401、停在报错态 —— **按一次刷新**即回登录页 |
+
+> 为什么不做「自动跳」：那要侵入 DSH 运行时（改写全局 `fetch` / XHR），
+> 而插件自己对合法会话回 401 时会被误伤成刷新循环。刷新一下的成本远低于这个风险。
+
 ## DSH 令牌自动配对
 
 DSH 启动时会打印一个一次性配对链接（`http://127.0.0.1:3082/?token=...`）。
@@ -234,6 +248,7 @@ DSH 启动时会打印一个一次性配对链接（`http://127.0.0.1:3082/?toke
 | `GATE_PASSWORD_HASH` | — | `sha256("dshai-gate-v1:" + 口令)` 的 64 位十六进制 |
 | `GATE_TOTP_SECRET` | — | Base32 的 TOTP 密钥（可含空格、大小写不敏感） |
 | `GATE_SESSION_SECRET` | — | 会话签名密钥，至少 16 字节 |
+| `TZ` | `Asia/Shanghai`（compose 默认） | 日志与后台页时间用的时区。本服务镜像基于 alpine、**没有 zoneinfo**，时区库是编译进二进制的（`_ "time/tzdata"`），所以独立二进制也生效；不设则退回 UTC |
 
 生成凭据的两个小工具（见 [运维脚本](#运维脚本)）：
 
@@ -253,6 +268,9 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 | **插件市场里安装 / 卸载 / 更新 / 启停全部 403 `untrusted origin`** | dshmarket **1.56.0** 起 `sameOrigin` 要求 Host 是回环；1.55.0 只比对 `Origin == Host`，所以此前正常 | 把**精确**路由加进 `gate/main.go` 的 `marketMutationPaths`（**不要**用前缀 `/dsh-market/`）。1.5.4 起已内置，探针第 ⑧ 项守着它 |
 | DSH 容器反复重启 | 数据目录里有容器读不到的条目（文件监听会抛 EACCES） | 起容器前跑 `scripts/perm-guard.sh`，并把备份**放在数据目录之外** |
 | 改了凭据后不生效 | 配置改动需要重启本服务 | `docker compose up -d gate`（会话密钥不变则已登录设备不受影响） |
+| **页面突然点不动、接口全 401，但登录页本身还能开** | 门禁会话还有效，DSH 自己那层已经失效 | 刷新页面 → 回到登录页 → 填 DSH 令牌重新配对（1.6.0 起导航会自动回登录页，见[会话失效时会怎样](#会话失效时会怎样)） |
+| 日志里**所有**「上游错误」的 IP 都是 `127.0.0.1` | 1.6.0 之前记的是**出站**请求，其 `X-Forwarded-For` 末尾是 nginx 自己 | 升级到 1.6.0（已改为用入站请求取 IP，安全日志才有归因） |
+| 后台页与日志时间比本地**早 8 小时** | 容器时区是 UTC，且镜像里没有 zoneinfo | 1.6.0 起时区库已内嵌，设 `TZ`（compose 默认 `Asia/Shanghai`）即可 |
 | 把自己锁在门外 | 忘了动态码 / 丢了手机 | 在**服务器上**重跑 `scripts/set-totp.sh` 换新密钥 |
 
 ## 运维脚本
@@ -260,9 +278,9 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 | 脚本 | 用途 |
 | --- | --- |
 | `scripts/selfcheck.sh` | 一键自检：容器健康、门禁是否拦住未授权、登录页是否正确、开放路由是否被挡、旧实例状态 |
-| `scripts/gate-probe.sh` | **门禁链路探针**：自签会话走完整链路，逐项验证插件接口 200、核心接口未受影响、未登录仍是 401、后台页与 `/gate` 短地址正常，另有 ⑥ X-Forwarded-For 信任方向、⑦ 市场围栏是否恢复（`/dsh-market/backup` 应 403、`/dsh-market/status` 应 200）、⑧ 市场变更路由已放行（应回业务错误 400 而非 403）、⑨ 排除清单仍被挡（`backup` / `self-uninstall` 应 403）。**改过 `loopbackOnlyPrefixes` / `marketMutationPaths` / `processControlPaths` / `clientIP` 后必跑**；也可带一个公网 URL 参数，走 nginx 做全链路回归 |
+| `scripts/gate-probe.sh` | **门禁链路探针**：自签会话走完整链路，逐项验证插件接口 200、核心接口未受影响、未登录仍是 401、后台页与 `/gate` 短地址正常，另有 ⑥ X-Forwarded-For 信任方向、⑦ 市场围栏是否恢复（`/dsh-market/backup` 应 403、`/dsh-market/status` 应 200）、⑧ 市场变更路由已放行（应回业务错误 400 而非 403）、⑨ 排除清单仍被挡（`backup` / `self-uninstall` 应 403）、⑩ DSH 会话失效时导航回登录页而 XHR 仍是 401。**改过 `loopbackOnlyPrefixes` / `marketMutationPaths` / `processControlPaths` / `clientIP` / `ModifyResponse` 后必跑**；也可带一个公网 URL 参数，走 nginx 做全链路回归 |
 | `scripts/perm-guard.sh` | **起容器前必跑**：检查数据目录里有没有容器读不到的条目（否则 DSH 崩溃重启） |
-| `scripts/set-password.sh` | 设置 / 更换口令 |
+| `scripts/set-password.sh` | 设置 / 更换口令。**只改自己那两个键**，保留 `.env` 里其它配置（1.6.0 前用截断重写，会把 TOTP 密钥一起抹掉 → 静默从双因子降级成单口令） |
 | `scripts/set-totp.sh` | 生成 TOTP 密钥；**先验证一次再写配置**，避免把自己锁在门外 |
 | `scripts/verify-totp.py` | 独立校验某个 TOTP 密钥与 6 位码是否匹配 |
 | `scripts/rollback.sh` | 回滚（可只停门禁，或停整套；不动数据） |
@@ -274,6 +292,8 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 - **密钥只从环境变量注入**：仓库与镜像里不含任何凭据；`.gitignore` 也挡掉了 `.env`、初始口令文件、数据目录
 - **不伪造请求头**：Host / Origin / Sec-Fetch-* **默认**一律原样透传，因此不存在 Cookie 归属漂移与重定向死循环。三处例外：`loopbackOnlyPrefixes`（纯 API 插件接口，前缀匹配；含 `.`/`..` 段的路径**不**给身份，因为上游会把它归一化成别的路径，等于给白名单开后门）、`marketMutationPaths`（插件市场的 20 条**精确**变更路由——用精确匹配而不是前缀，是因为实测 `/dsh-market/backup` 与 `/dsh-market/logs` **不带任何 DSH 会话**就能读到 profile 配置与日志，前缀一把梭会把「门禁 + DSH 令牌」压成一层），以及 `processControlPaths`（两条精确重启路径，只**擦掉** `X-Forwarded-For` / `X-Real-IP` / `Forwarded`；1.5.4 起这两条同时也要回环身份，因为 `trustedRestartRequest` 除了「无转发头」还要求回环 Host）
 - **按 IP 防爆破只信最后一跳**：`clientIP()` 取 `X-Forwarded-For` 的**最后一个**非空值。上游 nginx 用 `$proxy_add_x_forwarded_for`，语义是「客户端自带值 + 真实 IP」；取第一个等于把攻击者随手写的字符串当成客户端身份，按 IP 锁定会被每次换个伪造值绕过
+- **会话失效就地换登录页，不重定向**：只对「上游 **401** + 文档导航（`wantsHTML`）+ 复核确认没有 DSH 会话」生效。换成 302 会被 XHR 自动跟随，等于把 HTML 喂给 JSON 解析器；那次复核探测让规则只认真正的会话失效，插件对合法会话回的 401 不会被误伤
+- **日志归因一律用入站请求**：`Rewrite` 把入站请求存进出站请求的 context，`ErrorHandler` 与响应体包装都从那里取 IP 和路径。出站请求的 `X-Forwarded-For` 末尾是 nginx 自己，直接用会把所有上游错误记成同一个 `127.0.0.1`
 - **不做多余的事**：不实现用户系统、不做 OAuth、不引入数据库 —— 一台机器一个人，够用即可
 
 ## 许可与致谢

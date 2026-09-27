@@ -48,7 +48,7 @@ services:
 
   gate:
     build: ./gate
-    image: dsh-gate:1.5.4
+    image: dsh-gate:1.6.0
     container_name: dshai-gate
     restart: unless-stopped
     network_mode: host
@@ -61,6 +61,10 @@ services:
       - GATE_PASSWORD_HASH=${GATE_PASSWORD_HASH}
       - GATE_TOTP_SECRET=${GATE_TOTP_SECRET}
       - GATE_SESSION_SECRET=${GATE_SESSION_SECRET}
+      # 日志与后台页时间跟随本地时区。gate 镜像基于 alpine（无 zoneinfo），时区库由
+      # gate/main.go 里的 `_ "time/tzdata"` 内嵌；不设 TZ 会退回 UTC，页面时间早 8 小时
+      # （2026-09-27 实测：宿主 18:45:35 CST 而容器 10:45:35 UTC）。
+      - TZ=${TZ:-Asia/Shanghai}
     logging:
       driver: json-file
       options:
