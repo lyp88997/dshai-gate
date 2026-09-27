@@ -11,14 +11,22 @@ services:
     restart: unless-stopped
     init: true
     network_mode: host
-    # ★ 下限 1400m，勿降。两层依据（均实测）：
+    # ★ 内存：下限 1400m，本机取 2560m。依据（均实测）：
     #   ① Node 的 JS 堆上限 = 容器内存限额÷2 + 96MB
-    #      （1200m→696MB、飞牛 1500m→846MB；据此 800m 仅约 496MB）。
+    #      （1200m→696MB、1500m→846MB；据此 800m 仅约 496MB）。
     #   ② 硬需求 1358MB = DSH 本体 966MB + univer-office 网关 392MB。
     #      1200m 时超出部分被换进交换文件（memory.swap.current=622MB）；1400m 才装得下。
-    #   主机共 1974MB、宿主自身约需 350MB —— 1400m 已接近这台机器上限，不要再加。
-    mem_limit: 1400m
-    memswap_limit: 2400m
+    #   ③ 本机（VM-0-5-debian）总内存 3858MB、交换 1023MB；其他容器合计不到 100MB
+    #      （OpenResty 26 + frps 47 + 门禁 10）。2560m 给 DSH 约占 65%，
+    #      宿主自身（系统 + 1Panel）约需 690MB，仍留得住余量。
+    #      实测容器峰值 1225MB / 2048MB（60%），2560m 是这台 3.8GB 机器上的稳妥上限；
+    #      再往上到 3g，宿主只剩百来 MB，反代/隧道被杀的风险明显上升。
+    #
+    # ★ 不要用 docker update 手工改大了事：那不会写回本文件，
+    #   下一次 docker compose up -d 重建容器时会悄悄改回这里的值（2026-09-27 实测踩到过：
+    #   容器实际是 2g，本文件却是 1400m）。要调就改这里再重建。
+    mem_limit: 2560m
+    memswap_limit: 3584m
     # 崩溃转储会落到工作目录（core_pattern=core），一次 1.5GB，直接关掉
     ulimits:
       core: 0
