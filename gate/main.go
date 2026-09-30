@@ -888,7 +888,7 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
   </div>
   <form method="post" action="/__gate/restart" class="restartbar">
     <button class="btn" type="submit"{{if .RestartBusy}} disabled{{end}}>重启 DSH</button>
-    <span class="muted">装了插件、改了配置，需要重启才生效时用这里。会中断正在进行的对话约 30 秒；重启期间本页每 10 秒自动刷新，进度就在上面。</span>
+    <span class="muted">装了插件、改了配置，需要重启才生效时用这里。会中断正在进行的对话约 30 秒；重启期间可勾上页头的「自动刷新」盯着看，进度就在上面。</span>
   </form>
 </div>
 
@@ -1220,7 +1220,7 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	dshLeft := "没有记录（旧会话继续可用）"
 	if d, ok := dshSessionLeft(r); ok {
 		if d > 0 {
-			dshLeft = humanDur(d)
+			dshLeft = humanUptime(d)
 		} else {
 			dshLeft = "已过期"
 		}
