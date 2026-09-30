@@ -267,7 +267,7 @@ DSH 启动时会打印一个一次性配对链接（`http://127.0.0.1:3082/?toke
 > 门禁为此新增 `marketMutationPaths`：20 条**精确**路由，只呈现回环身份，**绝不用前缀**。
 > 刻意排除的仍是「重启 / 导出配置 / 快照 / Gist / WebDAV / 自卸载」。
 
-<img src="docs/admin.png" width="820" alt="dshai-gate 后台页：状态卡片 + DSH 控制 + 安全事件表">
+<img src="docs/admin.png" width="820" alt="dshai-gate 后台页：状态卡片 + 登录方式开关 + GitHub 登录配置 + DSH 会话 + DSH 控制 + 安全事件（默认收起）">
 
 **降噪**：同一 IP 的同类事件在 30 秒内合并为一条并累加次数，页面显示累计次数；
 标准输出只在新建条目时打印一行，不会把 `docker logs` 刷爆。
