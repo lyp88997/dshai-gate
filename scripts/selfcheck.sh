@@ -11,6 +11,9 @@ chk() {
 
 chk "DSH 容器健康" "$(docker inspect -f '{{.State.Health.Status}}' dshai-web 2>/dev/null || echo none)" "healthy"
 chk "gate 容器运行中" "$(docker inspect -f '{{.State.Status}}' dshai-gate 2>/dev/null || echo none)" "running"
+# 后台页里改的东西（GitHub client id/secret、登录方式开关）存在这里。
+# 不可写时门禁不会挂，但改动只在内存里、重启就丢（后台页会显示警告）。
+chk "后台配置目录可写" "$(docker exec dshai-gate test -w /data && echo yes || echo no 2>/dev/null)" "yes"
 chk "DSH 直连 :3082" "$(curl -s -o /dev/null -m 6 -w '%{http_code}' http://127.0.0.1:3082/)" "401"
 
 code=$(curl -s -o /tmp/.sc_login -m 8 -w '%{http_code}' -H 'Accept: text/html' http://127.0.0.1:2299/)

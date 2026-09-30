@@ -79,6 +79,10 @@ button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
 .cmd .copy:hover{filter:brightness(1.08)}
 .cmd .copy.ok{background:linear-gradient(135deg,#3fae7a,#2f9c6a)}
 .cmd .copy:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+a.go{display:block;text-align:center;text-decoration:none;margin-top:0;box-sizing:border-box}
+.or{display:flex;align-items:center;gap:10px;margin:15px 0 0;color:var(--muted);font-size:11.5px}
+.or::before,.or::after{content:"";height:1px;flex:1;background:var(--cardb)}
+@media (prefers-color-scheme: light){ a.go{color:#fff} }
 </style>
 </head>
 <body>
@@ -91,6 +95,8 @@ button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
       <small>{{.Subtitle}}</small>
     </div>
   </div>
+  {{if .HasGitHub}}<a class="go" href="/__gate/oauth/github/start?next={{.Next}}">用 GitHub 账号登录</a>
+  {{if or .NeedPassword .NeedTOTP}}<div class="or">或</div>{{end}}{{end}}
   {{if .NeedPassword}}
   <label for="pw">访问口令</label>
   <div class="field">
@@ -120,7 +126,7 @@ button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
   </div>
   <div class="hintline">DSH 每次重启令牌都会变；若本设备已有会话，上面这栏可留空。</div>
   {{end}}
-  <button class="go" type="submit" {{if .Locked}}disabled{{end}}>{{if .Locked}}已锁定{{else}}进入{{end}}</button>
+  {{if or .NeedPassword .NeedTOTP .TokenNeeded}}<button class="go" type="submit" {{if .Locked}}disabled{{end}}>{{if .Locked}}已锁定{{else if or .NeedPassword .NeedTOTP}}进入{{else}}配对 DSH 令牌{{end}}</button>{{end}}
   <div class="msg {{if .Locked}}lock{{else if .Error}}err{{end}}">{{if .Locked}}尝试次数过多，请等待 {{.Remain}} 后再试{{else}}{{.Error}}{{end}}</div>
   <div class="tip">{{.Tip}}</div>
 </form>

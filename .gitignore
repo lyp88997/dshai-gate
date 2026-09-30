@@ -4,6 +4,8 @@
 data/
 workspaces/
 home/
+gate-data/
+.dsh/
 *.bak-*
 *.tgz
 *.log

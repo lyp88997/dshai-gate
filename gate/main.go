@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -25,6 +26,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -34,6 +36,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,9 +57,18 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.6.0"
+	gateVersion  = "1.7.0"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
+
+	// dshStampName 记录「本设备上次与 DSH 完成配对的时间」。
+	// 为什么需要它：DSH 自己的会话 Cookie 不带有效期信息，门禁无法知道它还剩多久；
+	// 于是门禁在自己的会话体系里记一笔（GATE_DSH_SESSION_DAYS 天），
+	// 过期后就算 DSH 还认这个会话，门禁也要求重新配对（见 dshSessionFresh）。
+	dshStampName = "dshai_dsh"
+
+	// oauthStateName 是 GitHub 登录的防重放票据（code 换票前必须对得上）。
+	oauthStateName = "dshai_oauth"
 	totpPeriod   = 30
 	totpDigits   = 6
 	totpSkew     = 1
@@ -87,9 +99,27 @@ var (
 	listenAddr string
 	startedAt  = time.Now()
 
+	// dshSessionDs 是门禁认定的 DSH 会话有效期（天）。DSH 的会话 Cookie 不透露
+	// 自己的有效期，配一次票能用到什么时候只有门禁自己说了算（GATE_DSH_SESSION_DAYS）。
+	dshSessionDs int
+
+	// GitHub 登录用到两个基地址。抽出变量只为自测：e2e 用一个桩服务器
+	// 顶替 github.com 与 api.github.com，否则这条流程没法在本地跑通。
+	githubOAuthBase string
+	githubAPIBase   string
+
 	replayMu   sync.Mutex
 	lastUsedCt uint64
 )
+
+// setCookie 下发一枚门禁自家的 Cookie（HttpOnly + SameSite=Lax，Secure 跟随实际协议）。
+// maxAge 传负数即删除。
+func setCookie(w http.ResponseWriter, r *http.Request, name, value string, maxAge int) {
+	http.SetCookie(w, &http.Cookie{
+		Name: name, Value: value, Path: "/", MaxAge: maxAge,
+		HttpOnly: true, Secure: isHTTPS(r), SameSite: http.SameSiteLaxMode,
+	})
+}
 
 // ---------- 工具 ----------
 
@@ -112,22 +142,37 @@ func sign(payload string) string {
 }
 
 func issueCookie() (string, int) {
-	maxAge := sessionDs * 86400
-	exp := time.Now().Add(time.Duration(sessionDs) * 24 * time.Hour).Unix()
-	p := "v1." + strconv.FormatInt(exp, 10)
-	return p + "." + sign(p), maxAge
+	return issueSigned("v1", sessionDs)
+}
+
+// issueSigned 生成「版本号.过期时间.签名」三段式 Cookie 值。
+// ver 把不同用途的 Cookie 隔开（门禁会话 v1 / DSH 配对记录 d1）：格式与算法相同，
+// 域不同则互相不能冒用 —— 拿 DSH 配对记录当门禁会话用会验签失败。
+func issueSigned(ver string, days int) (string, int) {
+	exp := time.Now().Add(time.Duration(days) * 24 * time.Hour).Unix()
+	p := ver + "." + strconv.FormatInt(exp, 10)
+	return p + "." + sign(p), days * 86400
 }
 
 func cookieValid(v string) bool {
+	exp, ok := signedExp(v, "v1")
+	return ok && time.Now().Unix() <= exp
+}
+
+// signedExp 验签并解出过期时间（不判断是否过期，交给调用方）。
+func signedExp(v, ver string) (int64, bool) {
 	parts := strings.Split(v, ".")
-	if len(parts) != 3 || parts[0] != "v1" {
-		return false
+	if len(parts) != 3 || parts[0] != ver {
+		return 0, false
 	}
 	exp, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil || time.Now().Unix() > exp {
-		return false
+	if err != nil {
+		return 0, false
 	}
-	return hmac.Equal([]byte(sign(parts[0]+"."+parts[1])), []byte(parts[2]))
+	if !hmac.Equal([]byte(sign(parts[0]+"."+parts[1])), []byte(parts[2])) {
+		return 0, false
+	}
+	return exp, true
 }
 
 func isHTTPS(r *http.Request) bool {
@@ -459,37 +504,48 @@ type loginView struct {
 	Remain       string
 	NeedPassword bool
 	NeedTOTP     bool
+	HasGitHub    bool
 	HasSession   bool
 	TokenNeeded  bool
 }
 
+// subtitleOf / tipOf 都由「此刻实际可用的登录方式」算出来，所以后台一关掉某种
+// 方式，登录页与后台页的说明文案立刻跟着变（不用重启）。
 func subtitleOf() string {
+	pw, totp, _ := loginModes()
 	switch {
-	case needPw && needTotp:
+	case pw && totp:
 		return "需要口令 + 动态验证码"
-	case needTotp:
+	case totp:
 		return "需要动态验证码"
-	default:
+	case pw:
 		return "需要访问口令"
+	default:
+		return "需要 GitHub 账号"
 	}
 }
 
 func tipOf() string {
-	if needPw && needTotp {
+	pw, totp, _ := loginModes()
+	if pw && totp {
 		return "双因子保护 · 仅限本人使用"
 	}
-	if needTotp {
+	if totp {
 		return "受动态验证码保护 · 仅限本人使用"
 	}
-	return "受口令保护 · 仅限本人使用"
+	if pw {
+		return "受口令保护 · 仅限本人使用"
+	}
+	return "受 GitHub 账号与白名单保护 · 仅限本人使用"
 }
 
-// newLoginView 组装登录页数据（口令/动态码/令牌三块由全局配置与探测结果决定）
+// newLoginView 组装登录页数据（口令/动态码/GitHub/令牌四块由全局配置与探测结果决定）
 func newLoginView(errMsg string, locked bool, remain time.Duration, next string, hasSession bool) loginView {
+	pw, totp, gh := loginModes()
 	return loginView{
 		Title: siteTitle, Subtitle: subtitleOf(), Tip: tipOf(),
 		Next: sanitizeNext(next), Error: errMsg, Locked: locked,
-		Remain: humanDur(remain), NeedPassword: needPw, NeedTOTP: needTotp,
+		Remain: humanDur(remain), NeedPassword: pw, NeedTOTP: totp, HasGitHub: gh,
 		HasSession: hasSession, TokenNeeded: !hasSession,
 	}
 }
@@ -558,6 +614,32 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		renderLogin(w, http.StatusUnauthorized, fmt.Sprintf("%s，还可尝试 %d 次", msg, maxFailures-n), false, 0, next, hasSession)
 	}
 
+	// GitHub-only 模式（口令与动态验证码都关掉）下，这个表单里没有任何本地凭据可验，
+	// 只能拿 DSH 令牌补一次配对；★绝不能因为「提交了令牌」就发出门禁 Cookie，
+	// 否则任何人只要拿到 DSH 令牌就能进后台（那等于把两层并成一层）。
+	if pw, totp, _ := loginModes(); !pw && !totp {
+		token := strings.TrimSpace(r.FormValue("dstoken"))
+		if token == "" {
+			if hasSession {
+				http.Redirect(w, r, next, http.StatusSeeOther)
+				return
+			}
+			renderLogin(w, http.StatusUnauthorized,
+				"本设备还没有 DSH 会话，请在下方填写 DSH 令牌", false, 0, next, false)
+			return
+		}
+		pairCookie, err := dshPair(r, token)
+		if err != nil {
+			secNote("令牌换票失败", ip, "%v", err)
+			fail("DSH 令牌不正确或已失效（DSH 重启后旧令牌即作废）")
+			return
+		}
+		http.SetCookie(w, pairCookie)
+		secNote("令牌换票成功", ip, "已换取 DSH 会话 Cookie（当前登录方式只认 GitHub，未发门禁 Cookie）")
+		http.Redirect(w, r, next, http.StatusSeeOther)
+		return
+	}
+
 	if needPw {
 		got := hashPassword(r.FormValue("password"))
 		if subtle.ConstantTimeCompare([]byte(got), []byte(pwHash)) != 1 {
@@ -566,7 +648,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var totpCt uint64
-	if needTotp {
+	if totpOn() {
 		ct, ok := verifyTOTP(r.FormValue("code"), ip)
 		totpCt = ct
 		if !ok {
@@ -598,26 +680,21 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, pairCookie)
 		secNote("令牌换票成功", ip, "已换取 DSH 会话 Cookie")
 	}
-	if needTotp {
+	if totpOn() {
 		markTotpUsed(totpCt)
 	}
 
 	clearFail(ip)
 	val, maxAge := issueCookie()
-	http.SetCookie(w, &http.Cookie{
-		Name: cookieName, Value: val, Path: "/", MaxAge: maxAge,
-		HttpOnly: true, Secure: isHTTPS(r), SameSite: http.SameSiteLaxMode,
-	})
+	setCookie(w, r, cookieName, val, maxAge)
+	stampDSHSession(w, r) // 记下配对时间，后台页据此显示 DSH 会话剩余有效期
 	secNote("登录成功", ip, "方式=%s", subtitleOf())
 	http.Redirect(w, r, next, http.StatusSeeOther)
 }
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
 	secNote("登出", clientIP(r), "")
-	http.SetCookie(w, &http.Cookie{
-		Name: cookieName, Value: "", Path: "/", MaxAge: -1,
-		HttpOnly: true, Secure: isHTTPS(r), SameSite: http.SameSiteLaxMode,
-	})
+	setCookie(w, r, cookieName, "", -1)
 	http.Redirect(w, r, gatePrefix+"/login", http.StatusSeeOther)
 }
 
@@ -631,7 +708,6 @@ const adminHTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="10">
 <title>{{.Title}} · 安全日志</title>
 <style>
 :root{
@@ -700,6 +776,26 @@ td.n{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
 .muted{color:var(--muted);font-size:12.5px}
 .foot{text-align:center;font-size:11.5px;color:var(--muted);margin-top:6px}
 .foot a{color:var(--muted)}
+details{border-radius:12px}
+summary{cursor:pointer;font-size:12.5px;color:var(--muted);font-weight:600;letter-spacing:.4px;
+  list-style:none;display:flex;align-items:center;gap:8px}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"▸";font-size:12px;transition:transform .15s}
+details[open] summary::before{transform:rotate(90deg)}
+details[open] summary{margin-bottom:12px}
+.steps{margin:0 0 14px;padding-left:20px;color:var(--muted);font-size:12.5px;line-height:1.75}
+.steps code,.muted code{color:var(--fg);background:rgba(125,145,255,.14);padding:1px 6px;border-radius:6px;word-break:break-all}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px 16px;align-items:end}
+.grid2 label{display:block;color:var(--muted);font-size:12px}
+.grid2 label.wide{grid-column:1/-1}
+.grid2 label.chk{color:var(--fg);font-size:13px;display:flex;align-items:center;gap:8px;margin-bottom:4px}
+input[type=text],input[type=password],input:not([type]){
+  width:100%;margin-top:5px;padding:9px 11px;border-radius:10px;font:inherit;font-size:13px;
+  color:var(--fg);background:rgba(125,145,255,.10);border:1px solid var(--cardb)}
+input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,.18)}
+.banner{margin-bottom:16px;color:var(--fg);background:rgba(90,211,154,.16);border-color:rgba(90,211,154,.4)}
+.auto{display:flex;align-items:center;gap:6px;cursor:pointer}
+.auto input{width:auto;margin:0}
 @media (max-width:520px){
   body{padding:18px 13px 30px}
   .card{padding:15px 14px;border-radius:15px}
@@ -712,14 +808,17 @@ td.n{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
 <header>
   <div class="brand">
     <span class="dot"></span>
-    <h1>{{.Title}} · 安全日志<small>v{{.Version}} · 已运行 {{.Uptime}} · 每 10 秒自动刷新</small></h1>
+    <h1>{{.Title}} · 安全日志<small>v{{.Version}} · 已运行 {{.Uptime}}</small></h1>
   </div>
   <nav class="actions">
+    <label class="muted auto"><input type="checkbox" id="gauto"> 自动刷新</label>
     <a class="btn" href="/" target="_blank" rel="noopener">进入 DSH ↗</a>
     <a class="btn ghost" href="/__gate/admin">立即刷新</a>
     <a class="btn ghost danger" href="/__gate/logout">退出登录</a>
   </nav>
 </header>
+
+{{if .Msg}}<div class="card banner">{{.Msg}}</div>{{end}}
 
 <div class="card">
   <h2>当前状态</h2>
@@ -731,6 +830,53 @@ td.n{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
     <div class="stat"><b>全局限流</b><span>当前响应延迟 {{.Delay}}</span></div>
     <div class="stat"><b>锁定中的 IP</b><span>{{if .Locks}}{{range .Locks}}<span class="pill">{{.IP}} · 剩余 {{.Until}} · 失败 {{.Fails}} 次</span>{{end}}{{else}}无{{end}}</span></div>
   </div>
+</div>
+
+<div class="card">
+  <h2>登录方式（至少保留一种；关闭动态密码前必须先配好 GitHub 登录）</h2>
+  <div class="stats">
+    <div class="stat"><b>动态验证码</b><span>{{if not .TOTPConfigured}}<span class="badge badge-info">未配置密钥</span>{{else if .TOTPOn}}<span class="badge badge-ok">开启</span>{{else}}<span class="badge badge-info">已关闭</span>{{end}}</span></div>
+    <div class="stat"><b>GitHub 登录</b><span>{{if .GitHubReady}}<span class="badge badge-ok">开启</span>{{else if .GitHubEnabled}}<span class="badge badge-warn">已勾开启但配置不全</span>{{else}}<span class="badge badge-info">未开启</span>{{end}}</span></div>
+    <div class="stat"><b>访问口令</b><span>{{if .PwOn}}<span class="badge badge-ok">开启</span>{{else}}<span class="badge badge-info">未配置</span>{{end}}</span></div>
+  </div>
+  {{if .TOTPConfigured}}<form method="post" action="/__gate/methods" class="restartbar">
+    <button class="btn ghost" type="submit" name="totp" value="{{if .TOTPOn}}off{{else}}on{{end}}">{{if .TOTPOn}}关闭动态验证码登录{{else}}开启动态验证码登录{{end}}</button>
+    <span class="muted">改完立即生效，不用重启。密钥由服务器上的 <code>scripts/set-totp.sh</code> 生成，换密钥才会让现有验证码失效。</span>
+  </form>{{else}}<p class="muted">还没配动态验证码。服务器上执行 <code>bash /opt/dshai/scripts/set-totp.sh</code> 生成密钥即可。</p>{{end}}
+</div>
+
+<div class="card">
+  <h2>GitHub 登录（手动配置）</h2>
+  <ol class="steps">
+    <li>打开 <a href="https://github.com/settings/developers" target="_blank" rel="noopener">GitHub → Settings → Developer settings → OAuth Apps → New OAuth App</a>。</li>
+    <li>Application name 随便填，例如 <code>DSH 门禁</code>。</li>
+    <li>Homepage URL 填 <code>{{.BaseURL}}</code>。</li>
+    <li><b>Authorization callback URL 必须一字不差地填 <code>{{.CallbackURL}}</code></b>，差一个字符都会登录失败。</li>
+    <li>点 Register application，复制 <b>Client ID</b>；再点 Generate a new client secret，复制密钥（只显示一次）。</li>
+    <li>把两项粘到下面，允许名单填你自己的 GitHub 用户名（或数字 ID），勾上「开启 GitHub 登录」再保存。</li>
+  </ol>
+  <form method="post" action="/__gate/github" class="grid2">
+    <label>Client ID<input name="clientId" value="{{.GitHubClientID}}" autocomplete="off" spellcheck="false" placeholder="Ov23li…"></label>
+    <label>Client secret<input name="clientSecret" type="password" autocomplete="new-password" placeholder="{{if .GitHubSecretSet}}已保存（留空＝不修改）{{else}}粘贴 GitHub 给的密钥{{end}}"></label>
+    <label class="wide">允许登录的 GitHub 账号（用户名或数字 ID，逗号 / 空格分隔）
+      <input name="allow" value="{{.GitHubAllow}}" autocomplete="off" spellcheck="false" placeholder="your-name, 1234567"></label>
+    <label class="chk"><input type="checkbox" name="enabled" value="1"{{if .GitHubEnabled}} checked{{end}}> 开启 GitHub 登录</label>
+    <div><button class="btn" type="submit">保存 GitHub 配置</button></div>
+  </form>
+  <p class="muted">密钥只写进门禁自己的配置文件（<code>{{.StatePath}}</code>，权限 600），后台页永远只显示「已保存」，不回显原文。{{if not .StateWritable}}<b>警告：配置目录不可写，这里改的东西重启后会丢。</b>{{end}}</p>
+</div>
+
+<div class="card">
+  <h2>DSH 会话（门禁认定的有效期：{{.DSHDays}} 天）</h2>
+  <div class="stats">
+    <div class="stat"><b>本设备 DSH 会话</b><span>{{if .DSHOK}}<span class="badge badge-ok">有效</span>{{else}}<span class="badge badge-err">已失效或超出门禁有效期</span>{{end}}</span></div>
+    <div class="stat"><b>配对记录剩余</b><span>{{.DSHLeft}}</span></div>
+  </div>
+  <form method="post" action="/__gate/repair" class="restartbar">
+    <input name="dstoken" autocomplete="off" spellcheck="false" style="flex:1 1 300px;min-width:200px" placeholder="粘贴 DSH 令牌">
+    <button class="btn" type="submit">配对并登录</button>
+  </form>
+  <p class="muted">DSH 重启后旧令牌作废、会话也可能失效；在这里粘一次最新令牌即可，不用重走登录流程。取令牌：<code>docker logs dshai-web 2>&1 | grep -o 'token=[A-Za-z0-9_-]*' | tail -1</code></p>
 </div>
 
 <div class="card">
@@ -747,7 +893,8 @@ td.n{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
 </div>
 
 <div class="card">
-  <h2>最近事件（最新在上；同一 IP 的同类事件 30 秒内合并计数）</h2>
+  <details id="logsec">
+  <summary>最近事件（共 {{.Total}} 条，显示最新 {{.Shown}} 条）— 默认收起，点这一行展开</summary>
   <div class="tablewrap"><table>
     <thead><tr>
       <th scope="col">时间</th><th scope="col">事件</th><th scope="col">来源 IP</th><th scope="col">说明</th><th scope="col" style="text-align:right">次数</th>
@@ -764,10 +911,33 @@ td.n{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
     {{end}}
     </tbody>
   </table></div>
+  <p class="muted">最新在上；同一 IP 的同类事件 30 秒内合并计数。</p>
+  </details>
 </div>
 
 <div class="foot">只保留内存中最近 {{.Max}} 条，容器重启即清空 · 短地址 <a href="/gate">/gate</a></div>
 </div>
+<script>
+(function(){
+  var LOG='dshai_admin_log_open', AUTO='dshai_admin_auto';
+  function ls(k,v){ try{ if(v===undefined){return localStorage.getItem(k);} localStorage.setItem(k,v); }catch(e){ return null; } }
+  var d=document.getElementById('logsec');
+  if(ls(LOG)==='1'){ d.open=true; }
+  d.addEventListener('toggle',function(){ ls(LOG, d.open?'1':'0'); });
+  var box=document.getElementById('gauto'), on=ls(AUTO)!=='0';
+  box.checked=on;
+  box.addEventListener('change',function(){ on=box.checked; ls(AUTO, on?'1':'0'); });
+  var dirty=false;
+  Array.prototype.forEach.call(document.querySelectorAll('form input'), function(el){
+    if(el!==box){ el.addEventListener('input', function(){ dirty=true; }); }
+  });
+  setInterval(function(){
+    if(!on || dirty){ return; }
+    if(document.querySelector('input:focus,textarea:focus')){ return; }
+    location.reload();
+  }, 10000);
+})();
+</script>
 </body>
 </html>
 `
@@ -804,6 +974,28 @@ type adminView struct {
 	Max         int
 	Locks       []adminLock
 	Events      []adminEvent
+	Msg         string
+
+	// 登录方式
+	TOTPConfigured bool
+	TOTPOn         bool
+	PwOn           bool
+
+	// GitHub 登录
+	GitHubEnabled   bool
+	GitHubReady     bool
+	GitHubClientID  string
+	GitHubAllow     string
+	GitHubSecretSet bool
+	BaseURL         string
+	CallbackURL     string
+	StatePath       string
+	StateWritable   bool
+
+	// DSH 会话
+	DSHDays int
+	DSHOK   bool
+	DSHLeft string
 
 	RestartBusy   bool
 	RestartAt     string
@@ -1023,14 +1215,563 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	busy, at, result := restartSnapshot()
+	cfg := configSnapshot()
+	pw, totp, gh := modesOf(cfg)
+	dshLeft := "没有记录（旧会话继续可用）"
+	if d, ok := dshSessionLeft(r); ok {
+		if d > 0 {
+			dshLeft = humanDur(d)
+		} else {
+			dshLeft = "已过期"
+		}
+	}
 	_ = adminTpl.Execute(w, adminView{
 		Title: siteTitle, Version: gateVersion, Uptime: humanUptime(time.Since(startedAt)),
 		Mode: subtitleOf(), SessionDays: sessionDs, SessionLeft: sessionLeft(r),
 		Listen: listenAddr, Upstream: upstreamURL.String(),
 		Total: total, Shown: len(rows), Delay: globalDelay().String(), Max: secLogMax,
-		Locks: lockedSnapshot(), Events: rows,
+		Locks: lockedSnapshot(), Events: rows, Msg: adminMsg(),
+		TOTPConfigured: needTotp, TOTPOn: totp, PwOn: pw,
+		GitHubEnabled: cfg.GitHub.Enabled, GitHubReady: gh,
+		GitHubClientID:  cfg.GitHub.ClientID,
+		GitHubAllow:     strings.Join(cfg.GitHub.Allow, ", "),
+		GitHubSecretSet: cfg.GitHub.ClientSecret != "",
+		BaseURL:         externalBase(r), CallbackURL: githubCallbackURL(r),
+		StatePath: cfgPath, StateWritable: cfgWritable,
+		DSHDays: dshSessionDs, DSHOK: dshSessionFresh(r), DSHLeft: dshLeft,
 		RestartBusy: busy, RestartAt: at, RestartResult: result,
 	})
+}
+
+// ---------- 后台可改的配置（落盘） ----------
+
+// githubConfig 是 GitHub 登录的全部配置。
+// ★ 客户端密钥只存在门禁自己的配置文件里：compose 的 environment 会被
+//   `docker inspect` 原样看到，后台页填进去的密钥不能走那条路。
+type githubConfig struct {
+	Enabled      bool     `json:"enabled"`
+	ClientID     string   `json:"clientId"`
+	ClientSecret string   `json:"clientSecret"`
+	Allow        []string `json:"allow"`
+}
+
+// gateConfig 是门禁落盘的全部内容。
+// TOTPEnabled 用指针：要区分「从来没设置过」（按环境变量决定）与「后台明确关掉了」。
+type gateConfig struct {
+	TOTPEnabled *bool        `json:"totpEnabled,omitempty"`
+	GitHub      githubConfig `json:"github"`
+}
+
+var (
+	cfgMu       sync.Mutex
+	cfgPath     string
+	cfgWritable bool
+	cfg         gateConfig
+)
+
+// loadConfig 读配置。文件不存在 = 全默认；读坏了 = 用默认值并大声告警。
+// 两条降级路都不会放宽任何东西：GitHub 登录用不了、动态验证码回到「环境变量配了就开」。
+func loadConfig(path string) {
+	cfgPath = path
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		log.Printf("⚠️ 配置目录不可写（%v）。后台页改的设置重启后会丢；要保留请给门禁挂一个可写目录并把 GATE_STATE 指过去", err)
+		return
+	}
+	cfgWritable = true
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("⚠️ 读不到配置文件 %s（%v），按默认值继续", path, err)
+		}
+		return
+	}
+	var c gateConfig
+	if err := json.Unmarshal(b, &c); err != nil {
+		log.Printf("⚠️ 配置文件 %s 解析失败（%v），按默认值继续", path, err)
+		return
+	}
+	cfgMu.Lock()
+	cfg = c
+	cfgMu.Unlock()
+}
+
+// saveConfig 原子写盘（同目录临时文件 → rename），失败时把原因返回给后台页显示。
+func saveConfig(c gateConfig) error {
+	cfgMu.Lock()
+	cfg = c
+	path, ok := cfgPath, cfgWritable
+	cfgMu.Unlock()
+	if !ok {
+		return fmt.Errorf("配置目录不可写（GATE_STATE=%q），改动只在内存里生效", path)
+	}
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func configSnapshot() gateConfig {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfg
+}
+
+// modesOf 算出「按这份配置」实际可用的登录方式。
+func modesOf(c gateConfig) (pw, totp, gh bool) {
+	pw = needPw
+	totp = needTotp && (c.TOTPEnabled == nil || *c.TOTPEnabled)
+	g := c.GitHub
+	gh = g.Enabled && g.ClientID != "" && g.ClientSecret != "" && len(g.Allow) > 0
+	return
+}
+
+func loginModes() (pw, totp, gh bool) { return modesOf(configSnapshot()) }
+
+// totpOn 动态验证码此刻是否对外提供（密钥配了 + 后台没关掉）。
+func totpOn() bool { _, t, _ := loginModes(); return t }
+
+// githubReady GitHub 登录是否配置齐全且已开启。缺任何一项都不算「可用」，
+// 这样才能保证「关掉动态密码」时不会把唯一的进门方式一起关掉。
+func githubReady() bool { _, _, g := loginModes(); return g }
+
+// modesSummary 给启动日志与后台页用的一句话。
+func modesSummary() string {
+	pw, totp, gh := loginModes()
+	var xs []string
+	if pw {
+		xs = append(xs, "访问口令")
+	}
+	if totp {
+		xs = append(xs, "动态验证码")
+	}
+	if gh {
+		xs = append(xs, "GitHub")
+	}
+	if len(xs) == 0 {
+		return "无（配置异常）"
+	}
+	return strings.Join(xs, " + ")
+}
+
+func onOff(b bool) string {
+	if b {
+		return "开启"
+	}
+	return "关闭"
+}
+
+// splitAllow 把「逗号 / 空格 / 换行分隔」的允许名单切成切片并去重。
+func splitAllow(s string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, f := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == '，' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) {
+		f = strings.TrimSpace(f)
+		if f == "" || seen[strings.ToLower(f)] {
+			continue
+		}
+		seen[strings.ToLower(f)] = true
+		out = append(out, f)
+	}
+	return out
+}
+
+// ---------- DSH 会话有效期 ----------
+
+// stampDSHSession 记下「本设备此刻与 DSH 有会话」。记录只活 GATE_DSH_SESSION_DAYS 天。
+func stampDSHSession(w http.ResponseWriter, r *http.Request) {
+	v, maxAge := issueSigned("d1", dshSessionDs)
+	setCookie(w, r, dshStampName, v, maxAge)
+}
+
+// dshSessionLeft 返回门禁记录的 DSH 会话剩余有效期；没有记录时 ok=false。
+func dshSessionLeft(r *http.Request) (time.Duration, bool) {
+	c, err := r.Cookie(dshStampName)
+	if err != nil {
+		return 0, false
+	}
+	exp, ok := signedExp(c.Value, "d1")
+	if !ok {
+		return 0, false
+	}
+	return time.Until(time.Unix(exp, 0)), true
+}
+
+// dshSessionFresh 是第二层校验：DSH 真的认这个会话，且没超出本地记录的有效期。
+//
+// ★ 没有本地记录时以 DSH 的真实会话为准：升级前登录的浏览器不该因为多了这个新
+//   功能被踢出去（向后兼容）；有记录才按门禁的有效期算。
+func dshSessionFresh(r *http.Request) bool {
+	if !dshHasSession(r) {
+		return false
+	}
+	d, ok := dshSessionLeft(r)
+	if !ok {
+		return true
+	}
+	return d > 0
+}
+
+// ---------- GitHub 登录 ----------
+
+type githubIdentity struct {
+	Login string `json:"login"`
+	ID    int64  `json:"id"`
+}
+
+// githubAllowed 白名单比对：登录名不分大小写，数字 ID 精确匹配。
+func githubAllowed(id githubIdentity, allow []string) bool {
+	for _, a := range allow {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		if strings.EqualFold(a, id.Login) {
+			return true
+		}
+		if a == strconv.FormatInt(id.ID, 10) {
+			return true
+		}
+	}
+	return false
+}
+
+func externalBase(r *http.Request) string {
+	scheme := "http"
+	if isHTTPS(r) {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
+}
+
+func githubCallbackURL(r *http.Request) string {
+	return externalBase(r) + gatePrefix + "/oauth/github/callback"
+}
+
+// oauthTicket 生成防重放票据：s1.<过期>.<随机>.<base64url(next)>.<签名>。
+// 票据放在浏览器 Cookie 里（HttpOnly），服务端不存任何状态。
+func oauthTicket(next string) (string, string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", "", err
+	}
+	st := hex.EncodeToString(raw[:])
+	p := "s1." + strconv.FormatInt(time.Now().Add(10*time.Minute).Unix(), 10) + "." + st + "." +
+		base64.RawURLEncoding.EncodeToString([]byte(next))
+	return p + "." + sign(p), st, nil
+}
+
+// oauthTicketNext 验票并取回 next；want 是 GitHub 回跳时带上来的 state。
+func oauthTicketNext(r *http.Request, want string) (string, bool) {
+	c, err := r.Cookie(oauthStateName)
+	if err != nil || want == "" {
+		return "", false
+	}
+	parts := strings.Split(c.Value, ".")
+	if len(parts) != 5 {
+		return "", false
+	}
+	p := strings.Join(parts[:4], ".")
+	if parts[0] != "s1" || !hmac.Equal([]byte(sign(p)), []byte(parts[4])) {
+		return "", false
+	}
+	exp, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || time.Now().Unix() > exp {
+		return "", false
+	}
+	if !hmac.Equal([]byte(parts[2]), []byte(want)) {
+		return "", false
+	}
+	next, err := base64.RawURLEncoding.DecodeString(parts[3])
+	if err != nil {
+		return "", false
+	}
+	return sanitizeNext(string(next)), true
+}
+
+// handleGitHubStart 把浏览器送去 GitHub 授权页。
+func handleGitHubStart(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	g := configSnapshot().GitHub
+	if !githubReady() {
+		secNote("GitHub 登录", ip, "未配置或未开启，拒绝发起")
+		renderLogin(w, http.StatusNotFound, "GitHub 登录未开启", false, 0, r.URL.Query().Get("next"), dshHasSession(r))
+		return
+	}
+	next := sanitizeNext(r.URL.Query().Get("next"))
+	ticket, st, err := oauthTicket(next)
+	if err != nil {
+		http.Error(w, "内部错误", http.StatusInternalServerError)
+		return
+	}
+	setCookie(w, r, oauthStateName, ticket, 600)
+	q := url.Values{}
+	q.Set("client_id", g.ClientID)
+	q.Set("redirect_uri", githubCallbackURL(r))
+	q.Set("scope", "read:user")
+	q.Set("state", st)
+	q.Set("allow_signup", "false")
+	secNote("GitHub 登录", ip, "已跳转 GitHub 授权")
+	http.Redirect(w, r, githubOAuthBase+"/login/oauth/authorize?"+q.Encode(), http.StatusFound)
+}
+
+// githubExchange 用一次性 code 换访问令牌（服务端对服务端，带客户端密钥）。
+func githubExchange(r *http.Request, g githubConfig, code string) (string, error) {
+	form := url.Values{}
+	form.Set("client_id", g.ClientID)
+	form.Set("client_secret", g.ClientSecret)
+	form.Set("code", code)
+	form.Set("redirect_uri", githubCallbackURL(r))
+	req, err := http.NewRequest(http.MethodPost, githubOAuthBase+"/login/oauth/access_token", strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	var out struct {
+		AccessToken string `json:"access_token"`
+		Error       string `json:"error"`
+		Desc        string `json:"error_description"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return "", fmt.Errorf("GitHub 换票响应无法解析（HTTP %d）", resp.StatusCode)
+	}
+	if out.AccessToken == "" {
+		if out.Error != "" {
+			return "", fmt.Errorf("%s：%s", out.Error, out.Desc)
+		}
+		return "", fmt.Errorf("GitHub 没给访问令牌（HTTP %d）", resp.StatusCode)
+	}
+	return out.AccessToken, nil
+}
+
+// githubWhoami 用访问令牌查「这是哪个 GitHub 账号」。
+func githubWhoami(token string) (githubIdentity, error) {
+	var id githubIdentity
+	req, err := http.NewRequest(http.MethodGet, githubAPIBase+"/user", nil)
+	if err != nil {
+		return id, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "dshai-gate/"+gateVersion)
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return id, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 16384))
+	if resp.StatusCode != http.StatusOK {
+		return id, fmt.Errorf("查询 GitHub 账号失败（HTTP %d）", resp.StatusCode)
+	}
+	if err := json.Unmarshal(b, &id); err != nil {
+		return id, fmt.Errorf("账号信息无法解析（HTTP %d）", resp.StatusCode)
+	}
+	if id.Login == "" && id.ID == 0 {
+		return id, fmt.Errorf("GitHub 没返回账号信息")
+	}
+	return id, nil
+}
+
+// handleGitHubCallback 接收 GitHub 回跳：验票 → 换票 → 认账号 → 查白名单 → 发门禁会话。
+// 任何一步失败都 fail-closed，并且把原因记进安全日志。
+func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	g := configSnapshot().GitHub
+	if !githubReady() {
+		renderLogin(w, http.StatusNotFound, "GitHub 登录未开启", false, 0, "", dshHasSession(r))
+		return
+	}
+	q := r.URL.Query()
+	next, ok := oauthTicketNext(r, q.Get("state"))
+	if !ok {
+		secNote("GitHub 登录", ip, "票据校验失败（过期、被替换或不是本机发起）")
+		renderLogin(w, http.StatusBadRequest, "登录票据已失效，请重新点一次 GitHub 登录", false, 0, "", dshHasSession(r))
+		return
+	}
+	setCookie(w, r, oauthStateName, "", -1) // 票据一次性，用过即删
+	if e := q.Get("error"); e != "" {
+		secNote("GitHub 登录", ip, "GitHub 拒绝授权：%s（%s）", e, q.Get("error_description"))
+		renderLogin(w, http.StatusUnauthorized, "GitHub 授权被拒绝", false, 0, next, dshHasSession(r))
+		return
+	}
+	if q.Get("code") == "" {
+		secNote("GitHub 登录", ip, "回跳缺少 code")
+		renderLogin(w, http.StatusBadRequest, "GitHub 回跳参数不完整", false, 0, next, dshHasSession(r))
+		return
+	}
+	token, err := githubExchange(r, g, q.Get("code"))
+	if err != nil {
+		secNote("GitHub 换票失败", ip, "%v", err)
+		renderLogin(w, http.StatusBadGateway, "GitHub 换票失败，请稍后再试", false, 0, next, dshHasSession(r))
+		return
+	}
+	id, err := githubWhoami(token)
+	if err != nil {
+		secNote("GitHub 查询账号失败", ip, "%v", err)
+		renderLogin(w, http.StatusBadGateway, "查不到 GitHub 账号信息，请稍后再试", false, 0, next, dshHasSession(r))
+		return
+	}
+	if !githubAllowed(id, g.Allow) {
+		secNote("GitHub 登录", ip, "账号 %s(id=%d) 不在允许名单，拒绝", id.Login, id.ID)
+		renderLogin(w, http.StatusForbidden, "这个 GitHub 账号不在允许名单里", false, 0, next, dshHasSession(r))
+		return
+	}
+	val, maxAge := issueCookie()
+	setCookie(w, r, cookieName, val, maxAge)
+	if dshHasSession(r) {
+		stampDSHSession(w, r)
+	}
+	secNote("登录成功", ip, "方式=GitHub(%s)", id.Login)
+	http.Redirect(w, r, next, http.StatusSeeOther)
+}
+
+// ---------- 后台页的写入操作（登录方式 / GitHub 配置 / DSH 重新配对） ----------
+
+// adminMsgState 存「上一次操作的结果」，后台页顶部显示 60 秒。
+var adminMsgState struct {
+	mu   sync.Mutex
+	text string
+	at   time.Time
+}
+
+func setAdminMsg(format string, a ...any) {
+	adminMsgState.mu.Lock()
+	defer adminMsgState.mu.Unlock()
+	adminMsgState.text = fmt.Sprintf(format, a...)
+	adminMsgState.at = time.Now()
+}
+
+func adminMsg() string {
+	adminMsgState.mu.Lock()
+	defer adminMsgState.mu.Unlock()
+	if time.Since(adminMsgState.at) > 60*time.Second {
+		return ""
+	}
+	return adminMsgState.text
+}
+
+// adminPost 是所有后台写操作的共同前置：只收 POST、必须同源。
+func adminPost(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "只接受 POST", http.StatusMethodNotAllowed)
+		return false
+	}
+	if !sameOriginRequest(r) {
+		secNote("后台操作", clientIP(r), "非同一站点，已拒绝（%s）", r.URL.Path)
+		http.Error(w, "只接受同源请求", http.StatusForbidden)
+		return false
+	}
+	_ = r.ParseForm()
+	return true
+}
+
+func backToAdmin(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, gatePrefix+"/admin", http.StatusSeeOther)
+}
+
+// handleMethods 开关动态验证码登录。★ 校验后置：改完必须还剩至少一种登录方式，
+// 否则这一步会把门从里面锁死（GitHub 没配好又关掉动态密码 = 谁也进不来）。
+func handleMethods(w http.ResponseWriter, r *http.Request) {
+	if !adminPost(w, r) {
+		return
+	}
+	ip := clientIP(r)
+	c := configSnapshot()
+	on := r.FormValue("totp") == "on"
+	c.TOTPEnabled = &on
+	if pw, totp, gh := modesOf(c); !pw && !totp && !gh {
+		setAdminMsg("没改：这会让所有登录方式都关掉，谁也进不来。请先配好 GitHub 登录。")
+		secNote("登录方式变更", ip, "被拒：会导致没有任何登录方式")
+		backToAdmin(w, r)
+		return
+	}
+	err := saveConfig(c)
+	if err != nil {
+		setAdminMsg("动态验证码已%s（仅内存生效，没写进磁盘）：%v", onOff(on), err)
+	} else {
+		setAdminMsg("动态验证码已%s。下次打开登录页即生效，不用重启。", onOff(on))
+	}
+	secNote("登录方式变更", ip, "动态验证码=%s（当前可用：%s）", onOff(on), modesSummary())
+	backToAdmin(w, r)
+}
+
+// handleGithubSave 保存 GitHub 登录配置（后台页手填，密钥不回显）。
+func handleGithubSave(w http.ResponseWriter, r *http.Request) {
+	if !adminPost(w, r) {
+		return
+	}
+	ip := clientIP(r)
+	c := configSnapshot()
+	c.GitHub.ClientID = strings.TrimSpace(r.FormValue("clientId"))
+	if s := strings.TrimSpace(r.FormValue("clientSecret")); s != "" {
+		c.GitHub.ClientSecret = s // 留空 = 不改，避免后台页把密钥回显到浏览器
+	}
+	c.GitHub.Allow = splitAllow(r.FormValue("allow"))
+	c.GitHub.Enabled = r.FormValue("enabled") == "1"
+	if c.GitHub.Enabled && !(c.GitHub.ClientID != "" && c.GitHub.ClientSecret != "" && len(c.GitHub.Allow) > 0) {
+		setAdminMsg("没保存：要开启 GitHub 登录，客户端 ID、客户端密钥、允许名单三项都得填。")
+		secNote("GitHub 配置", ip, "被拒：开启但配置不完整")
+		backToAdmin(w, r)
+		return
+	}
+	if pw, totp, gh := modesOf(c); !pw && !totp && !gh {
+		setAdminMsg("没保存：这会让所有登录方式都关掉，谁也进不来。")
+		secNote("GitHub 配置", ip, "被拒：会导致没有任何登录方式")
+		backToAdmin(w, r)
+		return
+	}
+	err := saveConfig(c)
+	if err != nil {
+		setAdminMsg("GitHub 配置已保存（仅内存生效，没写进磁盘）：%v", err)
+	} else {
+		setAdminMsg("GitHub 配置已保存：登录=%s，允许名单 %d 个账号。", onOff(c.GitHub.Enabled), len(c.GitHub.Allow))
+	}
+	secNote("GitHub 配置", ip, "登录=%s，ClientID=%s，允许名单=%d 个",
+		onOff(c.GitHub.Enabled), c.GitHub.ClientID, len(c.GitHub.Allow))
+	backToAdmin(w, r)
+}
+
+// handleRepair 在后台页粘贴 DSH 令牌重新配对（DSH 重启后令牌作废、会话失效时用）。
+func handleRepair(w http.ResponseWriter, r *http.Request) {
+	if !adminPost(w, r) {
+		return
+	}
+	ip := clientIP(r)
+	token := strings.TrimSpace(r.FormValue("dstoken"))
+	if token == "" {
+		setAdminMsg("请先在输入框里粘贴 DSH 令牌。")
+		backToAdmin(w, r)
+		return
+	}
+	pairCookie, err := dshPair(r, token)
+	if err != nil {
+		secNote("令牌换票失败", ip, "%v", err)
+		setAdminMsg("配对失败：%v。DSH 重启后旧令牌即作废，请在服务器上取最新的一条。", err)
+		backToAdmin(w, r)
+		return
+	}
+	http.SetCookie(w, pairCookie)
+	stampDSHSession(w, r)
+	secNote("令牌换票成功", ip, "已从后台页重新配对 DSH 会话")
+	setAdminMsg("配对成功，本设备已经拿到新的 DSH 会话。")
+	backToAdmin(w, r)
 }
 
 func withGate(next http.Handler) http.Handler {
@@ -1042,6 +1783,12 @@ func withGate(next http.Handler) http.Handler {
 		case gatePrefix + "/logout":
 			handleLogout(w, r)
 			return
+		case gatePrefix + "/oauth/github/start":
+			handleGitHubStart(w, r)
+			return
+		case gatePrefix + "/oauth/github/callback":
+			handleGitHubCallback(w, r)
+			return
 		case "/gate":
 			// 短地址：好记、可收藏。未登录时会被后台页拦到登录页，
 			// 登录成功后 next 会把人送回 /__gate/admin
@@ -1050,19 +1797,30 @@ func withGate(next http.Handler) http.Handler {
 		}
 		if c, err := r.Cookie(cookieName); err == nil && cookieValid(c.Value) {
 			// 后台页与门禁同权限，不额外开鉴权口子
-			if r.URL.Path == gatePrefix+"/admin" {
+			switch r.URL.Path {
+			case gatePrefix + "/admin":
 				handleAdmin(w, r)
 				return
-			}
-			if r.URL.Path == gatePrefix+"/restart" {
+			case gatePrefix + "/restart":
 				handleRestart(w, r)
 				return
+			case gatePrefix + "/methods":
+				handleMethods(w, r)
+				return
+			case gatePrefix + "/github":
+				handleGithubSave(w, r)
+				return
+			case gatePrefix + "/repair":
+				handleRepair(w, r)
+				return
 			}
-			// ★ 远端执行接口的第二层：它自带 loopback 围栏但不校验 DSH 会话，
-			//   仅凭门禁 Cookie 就能在用户所有主机上执行命令。这里用浏览器带来的
-			//   Cookie 探一次 DSH，没有有效会话即拒（fail-closed）。
-			if dshSSHPath(r.URL.Path) && !dshHasSession(r) {
-				secNote("远端执行接口缺 DSH 会话", clientIP(r), "%s %s", r.Method, r.URL.Path)
+			// ★ 下面这些接口族自带 loopback 围栏，但**不校验 DSH 会话**：实测不带
+			//   任何 DSH Cookie 一样返回 200。只放行回环身份就等于把「门禁 + DSH 令牌」
+			//   压成一层 —— 远端执行接口能在用户配置的所有主机上执行命令，配置管理器
+			//   能导出配置，搜索设置能读改写上游凭据。所以这里加第二层：
+			//   DSH 真的认这个会话，且没有超出本地记录的有效期，才放行（fail-closed）。
+			if sessionRequiredPath(r.URL.Path) && !dshSessionFresh(r) {
+				secNote("接口缺有效 DSH 会话", clientIP(r), "%s %s", r.Method, r.URL.Path)
 				http.Error(w, "需要有效的 DSH 会话", http.StatusForbidden)
 				return
 			}
@@ -1086,8 +1844,36 @@ func withGate(next http.Handler) http.Handler {
 // 只放行回环身份就等于把「门禁 + DSH 令牌」压成一层，所以 withGate 另加第二层。
 const dshSSHPrefix = "/api/dsh-ssh/"
 
-// dshSSHPath 报告路径是否属于远端执行接口族。
-func dshSSHPath(path string) bool { return strings.HasPrefix(path, dshSSHPrefix) }
+// 另外两个同类前缀（2026-09-28 实测）：
+//
+//	/api/dsh-config-manager/        配置管理器：导出/下载 profile 配置、崩溃救援、备份计划
+//	/api/dsh-free-search-settings/  free-search 面板的配置桥：读写上游搜索服务的凭据
+//
+// 二者都是插件自带的「Host 必须是回环」围栏（源码里的 isLoopbackRequest /
+// loopback requests only），DSH 的 --trusted-host 对它无效，于是经反代一律 403
+// （free-search 的设置面板因此整个是坏的）。**同时也都不带任何 DSH 会话就能访问**，
+// 所以它们不是「加进前缀就完事」，必须一并进第二层。
+const (
+	configManagerPrefix      = "/api/dsh-config-manager/"
+	freeSearchSettingsPrefix = "/api/dsh-free-search-settings/"
+)
+
+// sessionRequiredPrefixes 列出「除门禁之外还必须带有效 DSH 会话」的接口前缀。
+var sessionRequiredPrefixes = []string{
+	dshSSHPrefix,
+	configManagerPrefix,
+	freeSearchSettingsPrefix,
+}
+
+// sessionRequiredPath 报告路径是否属于「必须有 DSH 会话」的接口族。
+func sessionRequiredPath(path string) bool {
+	for _, prefix := range sessionRequiredPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // loopbackOnlyPrefixes 列出「仅回环同源」类插件接口的前缀。
 // 这些插件把接口围栏为 loopback-only：Host 必须是 127.0.0.1/localhost 且
@@ -1100,6 +1886,8 @@ var loopbackOnlyPrefixes = []string{
 	"/api/dsh-skill-explorer/",
 	"/api/dsh-provider-usage/",
 	dshSSHPrefix,
+	configManagerPrefix,
+	freeSearchSettingsPrefix,
 	"/modlens/",
 	"/modsearch/",
 }
@@ -1419,11 +2207,21 @@ func main() {
 	if len(secret) < 16 {
 		log.Fatal("门禁未配置：GATE_SESSION_SECRET 缺失或过短。请运行 bash /opt/dshai/scripts/set-password.sh 或 set-totp.sh")
 	}
-	if !needPw && !needTotp {
-		log.Fatal("门禁未配置：既没有 GATE_PASSWORD_HASH 也没有 GATE_TOTP_SECRET —— 拒绝启动（fail-closed）。请运行 scripts/set-totp.sh")
-	}
 	if sessionDs <= 0 {
 		sessionDs = 30
+	}
+	dshSessionDs, _ = strconv.Atoi(env("GATE_DSH_SESSION_DAYS", "30"))
+	if dshSessionDs <= 0 {
+		dshSessionDs = 30
+	}
+	githubOAuthBase = strings.TrimSuffix(env("GATE_GITHUB_OAUTH_BASE", "https://github.com"), "/")
+	githubAPIBase = strings.TrimSuffix(env("GATE_GITHUB_API_BASE", "https://api.github.com"), "/")
+
+	// 后台可改的配置（落盘）。放在 fail-closed 之前：GitHub 登录就是在后台开的，
+	// 关掉动态密码后能不能启动，取决于这个文件读得读不出来。
+	loadConfig(env("GATE_STATE", "/data/state.json"))
+	if pw, totp, gh := loginModes(); !pw && !totp && !gh {
+		log.Fatal("门禁未配置：既没有口令，也没有可用的动态验证码 / GitHub 登录 —— 拒绝启动（fail-closed）。请运行 scripts/set-totp.sh，或先在后台配好 GitHub 登录")
 	}
 
 	target, err := url.Parse(raw)
@@ -1432,8 +2230,8 @@ func main() {
 	}
 	upstreamURL = target
 
-	secNote("启动", "-", "v%s 监听 %s → %s（%s，会话=%d 天，注入=%v，时区=%s）",
-		gateVersion, listen, target, subtitleOf(), sessionDs, inject, time.Local.String())
+	secNote("启动", "-", "v%s 监听 %s → %s（%s，会话=%d 天，DSH 会话=%d 天，注入=%v，时区=%s）",
+		gateVersion, listen, target, modesSummary(), sessionDs, dshSessionDs, inject, time.Local.String())
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           withGate(newProxy(target, inject)),

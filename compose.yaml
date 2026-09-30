@@ -56,7 +56,7 @@ services:
 
   gate:
     build: ./gate
-    image: dsh-gate:1.6.0
+    image: dsh-gate:1.7.0
     container_name: dshai-gate
     restart: unless-stopped
     network_mode: host
@@ -66,6 +66,15 @@ services:
       - GATE_INJECT=1
       - GATE_SITE_TITLE=Harness
       - GATE_SESSION_DAYS=30
+      # DSH 会话在门禁侧的有效期（天）：门禁自己记「这台设备上次配对成功」的时间，
+      # 超期就要求重新填一次 DSH 令牌（后台「DSH 会话」卡里直接填，不必重走登录）。
+      - GATE_DSH_SESSION_DAYS=30
+      # 后台页会改的配置（GitHub OAuth 的 client id/secret、登录方式开关）落在这里。
+      # ★ 不能写进 environment：那会被 `docker inspect` 原样看到。
+      # ★ 目录必须可写：镜像内门禁以 65534 运行，宿主上先执行一次
+      #   mkdir -p /opt/dshai/gate-data && chown 65534:65534 /opt/dshai/gate-data
+      #   目录不可写时门禁不会挂，只降级成「只存内存 + 日志告警」（后台页会显示警告）。
+      - GATE_STATE=/data/state.json
       - GATE_PASSWORD_HASH=${GATE_PASSWORD_HASH}
       - GATE_TOTP_SECRET=${GATE_TOTP_SECRET}
       - GATE_SESSION_SECRET=${GATE_SESSION_SECRET}
@@ -73,6 +82,8 @@ services:
       # gate/main.go 里的 `_ "time/tzdata"` 内嵌；不设 TZ 会退回 UTC，页面时间早 8 小时
       # （2026-09-27 实测：宿主 18:45:35 CST 而容器 10:45:35 UTC）。
       - TZ=${TZ:-Asia/Shanghai}
+    volumes:
+      - ./gate-data:/data
     logging:
       driver: json-file
       options:

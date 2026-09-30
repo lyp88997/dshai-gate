@@ -161,4 +161,26 @@ else
 fi
 printf '  %-42s [%s] 对照（两个会话都在时应 200）\n' "双 Cookie GET /" "$(get /)"
 
+echo "== ⑪ 本轮新增白名单前缀的第二层（必须仍然要求 DSH 会话）=="
+# /api/dsh-config-manager/ 与 /api/dsh-free-search-settings/ 是插件自带的「只认回环」围栏，
+# 门禁对它们呈现回环身份后不再被插件 403。但这**两个接口族不带任何 DSH 会话也能 200**，
+# 所以必须由门禁第二层补上「需要有效的 DSH 会话」，否则等于把「门禁 + DSH 令牌」压成一层
+# （1.5.3 曾因此拒绝把 /dsh-market/backup 变前缀，同一个坑）。
+# 第二层在转发之前判定，所以这里的第二个探针用 POST 打 GET 接口也无所谓。
+for p in /api/dsh-config-manager/status /api/dsh-free-search-settings/describe; do
+  C=$(curl -s -o /tmp/probe.out -w '%{http_code}' -H "Host: $HOSTHDR" -b "$GATECOOKIE" \
+    -H 'Sec-Fetch-Site: same-origin' -H "Origin: https://$HOSTHDR" -X POST -d '{}' "$GATE$p")
+  if [ "$C" = "403" ] && grep -q '需要有效的 DSH 会话' /tmp/probe.out; then
+    printf '  %-42s [%s] ✓ 第二层拦住\n' "无 DSH 会话 $p" "$C"
+  else
+    printf '  %-42s [%s] ✗ 第二层失效！%s\n' "无 DSH 会话 $p" "$C" "$(head -c 44 /tmp/probe.out)"
+  fi
+done
+C=$(get /api/dsh-config-manager/status)
+if [ "$C" = "200" ]; then printf '  %-42s [%s] ✓ 带 DSH 会话放行\n' "GET /api/dsh-config-manager/status" "$C"
+else printf '  %-42s [%s] ✗ 仍被插件围栏挡住\n' "GET /api/dsh-config-manager/status" "$C"; fi
+C=$(post /api/dsh-free-search-settings/describe)
+if [ "$C" = "403" ]; then printf '  %-42s [%s] ✗ 仍被插件围栏挡住\n' "POST /api/dsh-free-search-settings/describe" "$C"
+else printf '  %-42s [%s] ✓ 不再 403 %s\n' "POST /api/dsh-free-search-settings/describe" "$C" "$(head -c 40 /tmp/probe.out)"; fi
+
 rm -f /tmp/probe.out /tmp/admin.out /tmp/expire.out "$JAR"
