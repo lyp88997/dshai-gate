@@ -57,7 +57,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.7.0"
+	gateVersion  = "1.7.1"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 
@@ -85,6 +85,18 @@ const (
 	// 安全日志：内存环形缓冲的容量，与「同类事件合并窗口」
 	secLogMax   = 300
 	secCoalesce = 30 * time.Second
+
+	// adminRowsMax 是后台页一次渲染的事件行数上限：页面每 10 秒自动刷新，
+	// 把 secLogMax 行全塞进 DOM 纯属浪费。更早的记录仍在内存里（统计照算），
+	// 只是不渲染。
+	adminRowsMax = 100
+
+	// 标准输出的限速：一个窗口最多 outBurst 行，多出来的只在窗口结束时
+	// 汇总成一行。分布式扫描（每个新 IP 都会新建一条「未鉴权拦截」）在
+	// 没有这道闸时能把 docker logs 刷爆，而按 IP 合并对它无效。
+	outBurst      = 30
+	outWindowLen  = 10 * time.Second
+	outSuppressMg = "门禁：%d 秒内事件过多，另有 %d 条没往标准输出打（内存里仍保留，见后台页「最近事件」）"
 )
 
 var (
@@ -374,9 +386,13 @@ func noteGlobalFail() {
 // 重启即清空。需要长期历史就先给 compose 的 gate 服务加一个卷，再落盘
 // （注意 gate 以 nobody(65534) 运行，写宿主文件要配属主，别踩铁律 2）。
 //
-// 噪声控制：同一 IP 的同类事件在 secCoalesce 内合并为一条并累加次数，
-// 因此 stdout 也只在「新事件」时写一行——否则扫描器能把 docker 日志刷爆。
-// ponytail: 未鉴权拦截同样进环形缓冲，海量分布式扫描仍可能挤掉旧记录（上限 secLogMax 条）。
+// 噪声控制（两层，都是「合并 + 限速」，不丢数据）：
+//  1. 同一 IP 的同类事件在 secCoalesce 内合并为一条并累加次数，stdout 只在
+//     「新事件」时写一行、且写回的是最近那一条匹配条目（不是只比队尾）；
+//  2. stdout 另有硬闸：outWindowLen 内最多 outBurst 行，超出的在窗口结束时
+//     汇总一行说明被压掉多少条——分布式扫描每个新 IP 都是一条新事件，第 1 层
+//     对它无效，只有第 2 层能保证 docker logs 不被刷爆。
+// ponytail: 内存环形缓冲也仍会被挤掉旧记录（上限 secLogMax 条），这是设计选择。
 
 type secEvent struct {
 	Time  time.Time
@@ -392,24 +408,89 @@ var (
 	secSeen int64      // 累计事件数（含被合并的）
 )
 
+// 标准输出的限速状态（见 logNote）
+var (
+	outMu         sync.Mutex
+	outWindowAt   time.Time
+	outWindowN    int
+	outSuppressed int
+)
+
+// secMergeScan 是「往回找可合并的那一条」的扫描深度。
+// 实践中同一 IP 的同类事件总是挨着的，20 条足够覆盖交错；扫描深度有界，
+// 极端刷屏时也不会让一次 secNote 变成 O(缓冲长度)。
+const secMergeScan = 20
+
+// outDecision 是限速的全部策略，抽成纯函数只为可测（调用点只有 logNote）。
+// 返回：这一行放不放行；以及窗口刚翻篇时该补打的那行汇总（没有就是空串）。
+// 改 outWindowAt/outWindowN/outSuppressed，调用前须持有 outMu。
+func outDecision(now time.Time) (allow bool, summary string) {
+	if outWindowAt.IsZero() {
+		outWindowAt = now
+	}
+	if now.Sub(outWindowAt) >= outWindowLen {
+		if outSuppressed > 0 {
+			summary = fmt.Sprintf(outSuppressMg, int(outWindowLen/time.Second), outSuppressed)
+		}
+		outWindowAt, outWindowN, outSuppressed = now, 0, 0
+	}
+	outWindowN++
+	if outWindowN > outBurst {
+		outSuppressed++
+		return false, summary
+	}
+	return true, summary
+}
+
+// logNote 往标准输出写一行新事件，带限速。
+//
+// 环形缓冲挡得住重复请求（同 IP 同类合并），挡不住分布式扫描：每个新 IP 都是
+// 一条新事件，一个窗口内能有上千条。所以这里再加一道闸：窗口内只放 outBurst 行，
+// 其余攒到窗口结束时用一行汇总说清楚——既不静默丢，也不让 docker logs 被刷爆
+// （内存与后台页一直是完整的）。
+func logNote(kind, ip, text string) {
+	outMu.Lock()
+	allow, summary := outDecision(time.Now())
+	outMu.Unlock()
+	if summary != "" {
+		log.Print(summary)
+	}
+	if allow {
+		log.Printf("门禁：%s ip=%s %s", kind, ip, text)
+	}
+}
+
+// secNote 记一条安全事件：进内存环形缓冲（供后台页），新事件另写一行标准输出。
+//
+// 合并规则：同一个 IP 的同类事件在 secCoalesce 内并成一条，**并回最近的那一条
+// 匹配条目**，而不是只比对队尾——否则 A、B、A 这种交错会让同一个 IP 的同一类
+// 事件各占一行，扫描器稍微错开一下就能绕过合并、把 300 条缓冲挤满。
 func secNote(kind, ip, format string, args ...any) {
 	text := fmt.Sprintf(format, args...)
 	secMu.Lock()
-	defer secMu.Unlock()
 	secSeen++
+	merged := false
 	if n := len(secLog); n > 0 {
-		if last := &secLog[n-1]; last.Kind == kind && last.IP == ip &&
-			time.Since(last.Time) < secCoalesce {
-			last.Count++
-			last.Time = time.Now()
-			last.Text = text
-			return
+		for i := n - 1; i >= 0 && i >= n-secMergeScan; i-- {
+			e := &secLog[i]
+			if e.Kind == kind && e.IP == ip && time.Since(e.Time) < secCoalesce {
+				e.Count++
+				e.Time = time.Now()
+				e.Text = text
+				merged = true
+				break
+			}
 		}
 	}
-	log.Printf("门禁：%s ip=%s %s", kind, ip, text)
-	secLog = append(secLog, secEvent{Time: time.Now(), Kind: kind, IP: ip, Text: text, Count: 1})
-	if len(secLog) > secLogMax {
-		secLog = secLog[1:]
+	if !merged {
+		secLog = append(secLog, secEvent{Time: time.Now(), Kind: kind, IP: ip, Text: text, Count: 1})
+		if len(secLog) > secLogMax {
+			secLog = secLog[1:]
+		}
+	}
+	secMu.Unlock()
+	if !merged {
+		logNote(kind, ip, text)
 	}
 }
 
@@ -693,7 +774,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
-	secNote("登出", clientIP(r), "")
+	secNote("登出", clientIP(r), "已退出登录，门禁 Cookie 已清除")
 	setCookie(w, r, cookieName, "", -1)
 	http.Redirect(w, r, gatePrefix+"/login", http.StatusSeeOther)
 }
@@ -750,6 +831,13 @@ button.btn{font-family:inherit;font-size:13px;cursor:pointer}
 button.btn:disabled{opacity:.55;cursor:default;filter:none}
 .restartbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:15px}
 .restartbar .muted{flex:1 1 280px;min-width:210px}
+.actions form{margin:0;display:flex}
+.restartline{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 16px}
+.logtool{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px}
+.chip{padding:4px 11px;border-radius:999px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;
+  color:var(--muted);background:var(--card);border:1px solid var(--cardb)}
+.chip[aria-pressed=true]{color:#fff;background:linear-gradient(135deg,var(--accent),var(--accent2));border-color:transparent}
+table.filter-bad tr[data-tone=ok],table.filter-bad tr[data-tone=info]{display:none}
 .card{background:var(--card);border:1px solid var(--cardb);border-radius:18px;padding:18px 20px;margin-bottom:16px;
   box-shadow:var(--shadow);
   -webkit-backdrop-filter:blur(16px) saturate(140%);backdrop-filter:blur(16px) saturate(140%)}
@@ -811,12 +899,19 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
     <h1>{{.Title}} · 安全日志<small>v{{.Version}} · 已运行 {{.Uptime}}</small></h1>
   </div>
   <nav class="actions">
+    <form method="post" action="/__gate/restart"><button class="btn" type="submit"{{if .RestartBusy}} disabled{{end}} title="重启 DSH：会中断正在进行的对话约 30 秒">重启 DSH</button></form>
     <label class="muted auto"><input type="checkbox" id="gauto"> 自动刷新</label>
     <a class="btn" href="/" target="_blank" rel="noopener">进入 DSH ↗</a>
     <a class="btn ghost" href="/__gate/admin">立即刷新</a>
     <a class="btn ghost danger" href="/__gate/logout">退出登录</a>
   </nav>
 </header>
+
+<div class="restartline">
+  <span class="badge badge-{{if .RestartBusy}}warn{{else}}ok{{end}}">{{if .RestartBusy}}重启进行中{{else}}可重启{{end}}</span>
+  <span class="muted">最近一次发起：{{if .RestartAt}}{{.RestartAt}}{{else}}还没有{{end}} · 结果：{{if .RestartResult}}{{.RestartResult}}{{else}}—{{end}}</span>
+  <span class="muted">装了插件、改了配置要重启才生效时用这个按钮；会中断正在进行的对话约 30 秒，进度就写在这一行，配合「自动刷新」盯着看。</span>
+</div>
 
 {{if .Msg}}<div class="card banner">{{.Msg}}</div>{{end}}
 
@@ -826,7 +921,7 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
     <div class="stat"><b>登录方式</b><span>{{.Mode}}</span></div>
     <div class="stat"><b>本设备会话</b><span>剩余 {{.SessionLeft}}</span></div>
     <div class="stat"><b>监听 → 上游</b><span>{{.Listen}} → {{.Upstream}}</span></div>
-    <div class="stat"><b>事件计数</b><span>{{.Total}} 条（显示最近 {{.Shown}} 条）</span></div>
+    <div class="stat"><b>事件计数</b><span>累计 {{.Total}} 条（合并后显示 {{.Shown}} 行）</span></div>
     <div class="stat"><b>全局限流</b><span>当前响应延迟 {{.Delay}}</span></div>
     <div class="stat"><b>锁定中的 IP</b><span>{{if .Locks}}{{range .Locks}}<span class="pill">{{.IP}} · 剩余 {{.Until}} · 失败 {{.Fails}} 次</span>{{end}}{{else}}无{{end}}</span></div>
   </div>
@@ -846,7 +941,8 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
 </div>
 
 <div class="card">
-  <h2>GitHub 登录（手动配置）</h2>
+  <details id="ghsec"{{if not .GitHubConfigured}} open{{end}}>
+  <summary>GitHub 登录（手动配置）— {{if .GitHubConfigured}}已配置（{{if .GitHubEnabled}}开启中{{else}}未开启{{end}}），点这一行改{{else}}还没配好，点这一行展开设置{{end}}</summary>
   <ol class="steps">
     <li>打开 <a href="https://github.com/settings/developers" target="_blank" rel="noopener">GitHub → Settings → Developer settings → OAuth Apps → New OAuth App</a>。</li>
     <li>Application name 随便填，例如 <code>DSH 门禁</code>。</li>
@@ -864,6 +960,7 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
     <div><button class="btn" type="submit">保存 GitHub 配置</button></div>
   </form>
   <p class="muted">密钥只写进门禁自己的配置文件（<code>{{.StatePath}}</code>，权限 600），后台页永远只显示「已保存」，不回显原文。{{if not .StateWritable}}<b>警告：配置目录不可写，这里改的东西重启后会丢。</b>{{end}}</p>
+  </details>
 </div>
 
 <div class="card">
@@ -880,27 +977,19 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
 </div>
 
 <div class="card">
-  <h2>DSH 控制</h2>
-  <div class="stats">
-    <div class="stat"><b>重启状态</b><span>{{if .RestartBusy}}<span class="badge badge-warn">进行中</span>{{else}}<span class="badge badge-ok">就绪</span>{{end}}</span></div>
-    <div class="stat"><b>最近一次发起</b><span>{{if .RestartAt}}{{.RestartAt}}{{else}}还没有{{end}}</span></div>
-    <div class="stat"><b>结果</b><span>{{if .RestartResult}}{{.RestartResult}}{{else}}—{{end}}</span></div>
-  </div>
-  <form method="post" action="/__gate/restart" class="restartbar">
-    <button class="btn" type="submit"{{if .RestartBusy}} disabled{{end}}>重启 DSH</button>
-    <span class="muted">装了插件、改了配置，需要重启才生效时用这里。会中断正在进行的对话约 30 秒；重启期间可勾上页头的「自动刷新」盯着看，进度就在上面。</span>
-  </form>
-</div>
-
-<div class="card">
   <details id="logsec">
-  <summary>最近事件（共 {{.Total}} 条，显示最新 {{.Shown}} 条）— 默认收起，点这一行展开</summary>
-  <div class="tablewrap"><table>
+  <summary>最近事件（累计 {{.Total}} 条，合并后 {{.Shown}} 行{{if .Older}}，更早的 {{.Older}} 行没列出{{end}}；{{.Stats}}）— 点这一行展开/收起</summary>
+  <div class="logtool">
+    <button class="chip" type="button" data-f="all">全部</button>
+    <button class="chip" type="button" data-f="bad">只看异常（失败 / 拦截）</button>
+    <span class="muted" id="logfilterhint"></span>
+  </div>
+  <div class="tablewrap"><table id="logtable">
     <thead><tr>
       <th scope="col">时间</th><th scope="col">事件</th><th scope="col">来源 IP</th><th scope="col">说明</th><th scope="col" style="text-align:right">次数</th>
     </tr></thead>
     <tbody>
-    {{range .Events}}<tr>
+    {{range .Events}}<tr data-tone="{{.Tone}}">
       <td class="t">{{.Time}}</td>
       <td><span class="badge badge-{{.Tone}}">{{.Kind}}</span></td>
       <td class="ip">{{.IP}}</td>
@@ -911,7 +1000,7 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
     {{end}}
     </tbody>
   </table></div>
-  <p class="muted">最新在上；同一 IP 的同类事件 30 秒内合并计数。</p>
+  <p class="muted">最新在上；同一 IP 的同类事件 {{.Coalesce}} 秒内合并成一条并累加次数（中间夹了别的事件也照样并回最近那一条）。「只看异常」只是筛掉成功与中性行，统计数字不变。标准输出（<code>docker logs</code>）每 {{.OutWindow}} 秒最多打 {{.OutBurst}} 行新事件，超过的只在窗口结束时汇总一行——这张表始终是完整的。</p>
   </details>
 </div>
 
@@ -919,11 +1008,28 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
 </div>
 <script>
 (function(){
-  var LOG='dshai_admin_log_open', AUTO='dshai_admin_auto';
+  var LOG='dshai_admin_log_open', AUTO='dshai_admin_auto', FILTER='dshai_admin_log_filter';
   function ls(k,v){ try{ if(v===undefined){return localStorage.getItem(k);} localStorage.setItem(k,v); }catch(e){ return null; } }
   var d=document.getElementById('logsec');
   if(ls(LOG)==='1'){ d.open=true; }
   d.addEventListener('toggle',function(){ ls(LOG, d.open?'1':'0'); });
+  var tbl=document.getElementById('logtable'), chips=document.querySelectorAll('.logtool .chip'), hint=document.getElementById('logfilterhint');
+  function applyFilter(f){
+    if(f!=='bad'){ f='all'; }
+    tbl.className = f==='bad' ? 'filter-bad' : '';
+    Array.prototype.forEach.call(chips, function(c){ c.setAttribute('aria-pressed', String(c.getAttribute('data-f')===f)); });
+    var n=0;
+    if(tbl.tBodies[0]){
+      Array.prototype.forEach.call(tbl.tBodies[0].rows, function(r){
+        var t=r.getAttribute('data-tone');
+        if(t!=='ok' && t!=='info'){ n++; }
+      });
+    }
+    if(hint){ hint.textContent = f==='bad' ? ('已隐藏成功与中性行，留下 ' + n + ' 行异常') : ''; }
+    ls(FILTER, f);
+  }
+  Array.prototype.forEach.call(chips, function(c){ c.addEventListener('click', function(){ applyFilter(c.getAttribute('data-f')); }); });
+  applyFilter(ls(FILTER));
   var box=document.getElementById('gauto'), on=ls(AUTO)!=='0';
   box.checked=on;
   box.addEventListener('change',function(){ on=box.checked; ls(AUTO, on?'1':'0'); });
@@ -970,6 +1076,11 @@ type adminView struct {
 	Upstream    string
 	Total       int64
 	Shown       int
+	Older       int // 内存里更早、这次没渲染的事件条数
+	Stats       string
+	Coalesce    int // 同类事件合并窗口（秒），文案跟着常量走
+	OutBurst    int // 标准输出每窗口最多几行，同上
+	OutWindow   int // 标准输出的限速窗口（秒），同上
 	Delay       string
 	Max         int
 	Locks       []adminLock
@@ -982,9 +1093,10 @@ type adminView struct {
 	PwOn           bool
 
 	// GitHub 登录
-	GitHubEnabled   bool
-	GitHubReady     bool
-	GitHubClientID  string
+	GitHubEnabled    bool
+	GitHubReady      bool
+	GitHubConfigured bool // ClientID 与 secret 都存了（不看开关），用来决定配置卡默认展开还是折叠
+	GitHubClientID   string
 	GitHubAllow     string
 	GitHubSecretSet bool
 	BaseURL         string
@@ -1002,18 +1114,84 @@ type adminView struct {
 	RestartResult string
 }
 
-// toneOf 把事件种类映射成配色：失败类红、拦截类黄、成功类绿、其余中性
-func toneOf(kind string) string {
+// toneOf 把事件种类（必要时结合说明文字）映射成配色：失败类红、拦截类黄、
+// 成功类绿、其余中性。
+//
+// 只看 Kind 不够：同一类事件里既有成功也有被拒（「GitHub 登录」既有
+// 「已跳转 GitHub 授权」也有「不在允许名单，拒绝」；「后台操作」既有正常保存
+// 也有「非同一站点，已拒绝」），一律涂成中性灰等于把一次拒绝藏起来。所以先按
+// Kind 判，判不出来再看说明里的信号词。
+func toneOf(kind, text string) string {
 	switch kind {
 	case "登录成功", "令牌换票成功", "登出":
 		return "ok"
-	case "验证失败", "锁定", "动态码重放", "令牌换票失败", "上游错误":
+	case "验证失败", "锁定", "动态码重放", "令牌换票失败", "上游错误", "探测 DSH 失败",
+		"GitHub 换票失败", "GitHub 查询账号失败":
 		return "err"
-	case "未鉴权拦截", "锁定期间尝试":
+	case "未鉴权拦截", "锁定期间尝试", "接口缺有效 DSH 会话":
 		return "warn"
-	default:
-		return "info"
 	}
+	if strings.Contains(text, "被拒") || strings.Contains(text, "拒绝") || strings.Contains(text, "失败") {
+		return "err"
+	}
+	if strings.Contains(text, "拦截") || strings.Contains(text, "锁定") {
+		return "warn"
+	}
+	return "info"
+}
+
+// logStats 拼出摘要行里的分布统计（只列非零项）——一眼能看出这份日志里
+// 到底什么在刷屏：是有人在扫（拦截），还是真有人在试密码（失败）。
+func logStats(bad, warn, ok, info int) string {
+	var xs []string
+	if bad > 0 {
+		xs = append(xs, fmt.Sprintf("失败 %d", bad))
+	}
+	if warn > 0 {
+		xs = append(xs, fmt.Sprintf("拦截 %d", warn))
+	}
+	if ok > 0 {
+		xs = append(xs, fmt.Sprintf("成功 %d", ok))
+	}
+	if info > 0 {
+		xs = append(xs, fmt.Sprintf("其他 %d", info))
+	}
+	if len(xs) == 0 {
+		return "暂无事件"
+	}
+	return strings.Join(xs, " · ")
+}
+
+// buildRows 把内存里的事件转成页面行（最新在最前），最多 adminRowsMax 行，
+// 同时按配色分类计数。
+//
+// ★统计走的是**全部**事件：只渲染 100 行、以及前端「只看异常」筛选都不该让
+// 摘要里的数字变小——否则「拦截 3」会随着旧记录被挤出渲染范围而消失，看着像
+// 攻击停了。这也正是 T10c 要断言页面渲染到底的原因。
+func buildRows(evs []secEvent) (rows []adminEvent, bad, warn, ok, info int) {
+	rows = make([]adminEvent, 0, min(len(evs), adminRowsMax))
+	for i := len(evs) - 1; i >= 0; i-- { // 最新在最上面
+		e := evs[i]
+		tone := toneOf(e.Kind, e.Text)
+		switch tone {
+		case "err":
+			bad++
+		case "warn":
+			warn++
+		case "ok":
+			ok++
+		default:
+			info++
+		}
+		if len(rows) >= adminRowsMax {
+			continue // 超出渲染上限的行不再渲染，但已经计入统计
+		}
+		rows = append(rows, adminEvent{
+			Time: e.Time.Format("01-02 15:04:05"), Kind: e.Kind, Tone: tone,
+			IP: e.IP, Text: e.Text, Count: e.Count,
+		})
+	}
+	return rows, bad, warn, ok, info
 }
 
 // sessionLeft 从本设备 Cookie 的过期时间算出剩余有效期
@@ -1202,14 +1380,7 @@ func handleRestart(w http.ResponseWriter, r *http.Request) {
 
 func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	evs, total := secSnapshot()
-	rows := make([]adminEvent, 0, len(evs))
-	for i := len(evs) - 1; i >= 0; i-- { // 最新在最上面
-		e := evs[i]
-		rows = append(rows, adminEvent{
-			Time: e.Time.Format("01-02 15:04:05"), Kind: e.Kind, Tone: toneOf(e.Kind),
-			IP: e.IP, Text: e.Text, Count: e.Count,
-		})
-	}
+	rows, nBad, nWarn, nOK, nInfo := buildRows(evs)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Frame-Options", "DENY")
@@ -1229,14 +1400,18 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 		Title: siteTitle, Version: gateVersion, Uptime: humanUptime(time.Since(startedAt)),
 		Mode: subtitleOf(), SessionDays: sessionDs, SessionLeft: sessionLeft(r),
 		Listen: listenAddr, Upstream: upstreamURL.String(),
-		Total: total, Shown: len(rows), Delay: globalDelay().String(), Max: secLogMax,
+		Total: total, Shown: len(rows), Older: len(evs) - len(rows),
+		Stats: logStats(nBad, nWarn, nOK, nInfo), Coalesce: int(secCoalesce / time.Second),
+		OutBurst: outBurst, OutWindow: int(outWindowLen / time.Second),
+		Delay: globalDelay().String(), Max: secLogMax,
 		Locks: lockedSnapshot(), Events: rows, Msg: adminMsg(),
 		TOTPConfigured: needTotp, TOTPOn: totp, PwOn: pw,
 		GitHubEnabled: cfg.GitHub.Enabled, GitHubReady: gh,
-		GitHubClientID:  cfg.GitHub.ClientID,
-		GitHubAllow:     strings.Join(cfg.GitHub.Allow, ", "),
-		GitHubSecretSet: cfg.GitHub.ClientSecret != "",
-		BaseURL:         externalBase(r), CallbackURL: githubCallbackURL(r),
+		GitHubClientID:   cfg.GitHub.ClientID,
+		GitHubAllow:      strings.Join(cfg.GitHub.Allow, ", "),
+		GitHubSecretSet:  cfg.GitHub.ClientSecret != "",
+		GitHubConfigured: cfg.GitHub.ClientID != "" && cfg.GitHub.ClientSecret != "",
+		BaseURL:          externalBase(r), CallbackURL: githubCallbackURL(r),
 		StatePath: cfgPath, StateWritable: cfgWritable,
 		DSHDays: dshSessionDs, DSHOK: dshSessionFresh(r), DSHLeft: dshLeft,
 		RestartBusy: busy, RestartAt: at, RestartResult: result,
