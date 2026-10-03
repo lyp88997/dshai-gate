@@ -60,7 +60,7 @@ services:
 
   gate:
     build: ./gate
-    image: dsh-gate:1.7.3
+    image: dsh-gate:1.8.0
     container_name: dshai-gate
     restart: unless-stopped
     network_mode: host
