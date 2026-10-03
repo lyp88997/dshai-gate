@@ -57,7 +57,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.7.1"
+	gateVersion  = "1.7.2"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 
@@ -2019,18 +2019,21 @@ func withGate(next http.Handler) http.Handler {
 // 只放行回环身份就等于把「门禁 + DSH 令牌」压成一层，所以 withGate 另加第二层。
 const dshSSHPrefix = "/api/dsh-ssh/"
 
-// 另外两个同类前缀（2026-09-28 实测）：
+// 另外几个同类前缀（2026-09-28 / 2026-10-03 实测）：
 //
 //	/api/dsh-config-manager/        配置管理器：导出/下载 profile 配置、崩溃救援、备份计划
 //	/api/dsh-free-search-settings/  free-search 面板的配置桥：读写上游搜索服务的凭据
+//	/api/market/                    应用市场客户端：列已装、装皮肤/预设/宠物
 //
-// 二者都是插件自带的「Host 必须是回环」围栏（源码里的 isLoopbackRequest /
+// 三者都是插件自带的「Host 必须是回环」围栏（源码里的 isLoopbackRequest /
 // loopback requests only），DSH 的 --trusted-host 对它无效，于是经反代一律 403
-// （free-search 的设置面板因此整个是坏的）。**同时也都不带任何 DSH 会话就能访问**，
-// 所以它们不是「加进前缀就完事」，必须一并进第二层。
+// （free-search 的设置面板因此整个是坏的、市场面板的「已安装」列表也出不来）。
+// **同时也都不带任何 DSH 会话就能访问**，所以它们不是「加进前缀就完事」，
+// 必须一并进第二层。
 const (
 	configManagerPrefix      = "/api/dsh-config-manager/"
 	freeSearchSettingsPrefix = "/api/dsh-free-search-settings/"
+	marketPrefix             = "/api/market/"
 )
 
 // sessionRequiredPrefixes 列出「除门禁之外还必须带有效 DSH 会话」的接口前缀。
@@ -2038,6 +2041,7 @@ var sessionRequiredPrefixes = []string{
 	dshSSHPrefix,
 	configManagerPrefix,
 	freeSearchSettingsPrefix,
+	marketPrefix,
 }
 
 // sessionRequiredPath 报告路径是否属于「必须有 DSH 会话」的接口族。
@@ -2063,6 +2067,7 @@ var loopbackOnlyPrefixes = []string{
 	dshSSHPrefix,
 	configManagerPrefix,
 	freeSearchSettingsPrefix,
+	marketPrefix,
 	"/modlens/",
 	"/modsearch/",
 }
@@ -2088,6 +2093,10 @@ func loopbackOnlyPath(path string) bool {
 //   profile 配置与日志 —— 它们唯一的门就是 sameOrigin。用前缀一把梭等于把
 //   「门禁 + DSH 令牌」压成一层（同 1.5.1 的教训）。这里只列「唯一能力就是
 //   管理插件」的路由。
+//
+// 注意别把 /dsh-market/（市场插件本体）和 /api/market/（市场客户端
+// @linxin666/dsh-client-ui-market）搞混：后者只有「列已装 + 装皮肤/预设/宠物」，
+// 没有导出配置或读日志这类能力，所以走前缀 + 第二层（见 marketPrefix）。
 //
 // 刻意排除（仍由市场自己的围栏挡住，经门禁保持 403）：
 //

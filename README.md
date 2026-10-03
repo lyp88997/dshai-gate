@@ -283,6 +283,12 @@ DSH 启动时会打印一个一次性配对链接（`http://127.0.0.1:3082/?toke
 > 启停全部 403 `untrusted origin`**（1.55.0 只比对 `Origin == Host`，所以此前一直正常）。
 > 门禁为此新增 `marketMutationPaths`：20 条**精确**路由，只呈现回环身份，**绝不用前缀**。
 > 刻意排除的仍是「重启 / 导出配置 / 快照 / Gist / WebDAV / 自卸载」。
+>
+> **1.7.2 起，应用市场客户端（`@linxin666/dsh-client-ui-market`）另有一条前缀白名单。**
+> 它注册的是 `/api/market/`（列已安装、装皮肤 / 预设 / 宠物），围栏写在
+> `isLoopbackRequest`（socket 与 Host 都必须是回环），但**不校验 DSH 会话**，
+> 所以和配置管理器 / 自由搜索设置一样走「前缀 + 第二层」。它与上面那张
+> `/dsh-market/` 精确表是**两个不同的插件**，别混。探针第 ⑫ 项守着它。
 
 > 📷 下图是 1.7.0 的实拍，**1.7.1 改了布局**：重启按钮已挪到页头右上角、GitHub 卡配好后会自动折叠，
 > 图待重拍（`docs/admin.png`）。
@@ -290,7 +296,10 @@ DSH 启动时会打印一个一次性配对链接（`http://127.0.0.1:3082/?toke
 <img src="docs/admin.png" width="820" alt="dshai-gate 后台页：页头按钮（重启 DSH / 自动刷新 / 进入 DSH）+ 状态卡片 + 登录方式开关 + GitHub 登录配置（配好后折叠）+ DSH 会话 + 安全事件（默认收起）">
 
 **降噪**：同一 IP 的同类事件在 30 秒内合并为一条并累加次数，页面显示累计次数；
-标准输出只在新建条目时打印一行，不会把 `docker logs` 刷爆。
+标准输出只在新建条目时打印一行，不会把 `docker logs` 刷爆。**1.7.1 起再加一道闸**：
+任意 10 秒最多往标准输出打 30 行，超出的**不丢**（内存里照记、后台页照显示），
+只在窗口结束时补一行汇总说明压掉了多少条。页面上的统计口径是**全部事件**，
+不是页面上看得见的那几行。
 
 > ⚠️ 事件只存在内存里（最多 300 条），**容器重启即清空**。
 > 同一份事件也会写到标准输出，可用 `docker logs <容器名>` 回看（受 Docker 日志轮转限制）；
@@ -329,7 +338,7 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 | 日志里每分钟一条 `upstream timed out` | 反代没设 `proxy_read_timeout` | 按[第 3 步](#3-反向代理只需要最普通的这几行)补齐 |
 | 特权接口 403 | 忘了 `--trusted-host`，或中间层改写了 Host | 让反代 **原样透传 Host**，并把域名加进 `--trusted-host` |
 | 插件面板接口 **403 / 400**（任务看板、技能中心、用量统计、配置管理器、自由搜索设置…） | 该插件把接口围栏成 loopback-only，而 `--trusted-host` 管不到插件自己的围栏 | 把它的接口前缀加进 `gate/main.go` 的 `loopbackOnlyPrefixes`，**并把前缀同时加进 `sessionRequiredPrefixes`**（见下一行），重建后用 `scripts/gate-probe.sh` 回归 |
-| 加了前缀之后，**只带门禁会话、不带 DSH 令牌也能调**那些接口 | 有些插件接口族**不带 DSH 会话也返回 200**（配置管理器、自由搜索设置就是如此），它们的唯一门就是 loopback 围栏；门禁呈现回环身份等于把两层压成一层 | 前缀要同时进 `sessionRequiredPrefixes`，由门禁第二层补上「需要有效的 DSH 会话」。1.7.0 起 `/api/dsh-ssh/`、`/api/dsh-config-manager/`、`/api/dsh-free-search-settings/` 都走这条线，探针第 ⑪ 项守着它 |
+| 加了前缀之后，**只带门禁会话、不带 DSH 令牌也能调**那些接口 | 有些插件接口族**不带 DSH 会话也返回 200**（配置管理器、自由搜索设置就是如此），它们的唯一门就是 loopback 围栏；门禁呈现回环身份等于把两层压成一层 | 前缀要同时进 `sessionRequiredPrefixes`，由门禁第二层补上「需要有效的 DSH 会话」。1.7.0 起 `/api/dsh-ssh/`、`/api/dsh-config-manager/`、`/api/dsh-free-search-settings/` 都走这条线，**1.7.2 起又加上了 `/api/market/`（应用市场客户端）**，探针第 ⑪ / ⑫ 项守着它们 |
 | **插件市场里安装 / 卸载 / 更新 / 启停全部 403 `untrusted origin`** | dshmarket **1.56.0** 起 `sameOrigin` 要求 Host 是回环；1.55.0 只比对 `Origin == Host`，所以此前正常 | 把**精确**路由加进 `gate/main.go` 的 `marketMutationPaths`（**不要**用前缀 `/dsh-market/`）。1.5.4 起已内置，探针第 ⑧ 项守着它 |
 | DSH 容器反复重启 | 数据目录里有容器读不到的条目（文件监听会抛 EACCES） | 起容器前跑 `scripts/perm-guard.sh`，并把备份**放在数据目录之外** |
 | 改了凭据后不生效 | 配置改动需要重启本服务 | `docker compose up -d gate`（会话密钥不变则已登录设备不受影响） |
@@ -345,7 +354,7 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 | 脚本 | 用途 |
 | --- | --- |
 | `scripts/selfcheck.sh` | 一键自检：容器健康、门禁是否拦住未授权、登录页是否正确、开放路由是否被挡、旧实例状态 |
-| `scripts/gate-probe.sh` | **门禁链路探针**：自签会话走完整链路，逐项验证插件接口 200、核心接口未受影响、未登录仍是 401、后台页与 `/gate` 短地址正常，另有 ⑥ X-Forwarded-For 信任方向、⑦ 市场围栏是否恢复（`/dsh-market/backup` 应 403、`/dsh-market/status` 应 200）、⑧ 市场变更路由已放行（应回业务错误 400 而非 403）、⑨ 排除清单仍被挡（`backup` / `self-uninstall` 应 403）、⑩ DSH 会话失效时导航回登录页而 XHR 仍是 401、**⑪ 1.7.0 新增的两个前缀（配置管理器 / 自由搜索设置）经门禁不再被插件 403，且无 DSH 会话时被第二层拦成 403**。**改过 `loopbackOnlyPrefixes` / `sessionRequiredPrefixes` / `marketMutationPaths` / `processControlPaths` / `clientIP` / `ModifyResponse` 后必跑**；也可带一个公网 URL 参数，走 nginx 做全链路回归 |
+| `scripts/gate-probe.sh` | **门禁链路探针**：自签会话走完整链路，逐项验证插件接口 200、核心接口未受影响、未登录仍是 401、后台页与 `/gate` 短地址正常，另有 ⑥ X-Forwarded-For 信任方向、⑦ 市场围栏是否恢复（`/dsh-market/backup` 应 403、`/dsh-market/status` 应 200）、⑧ 市场变更路由已放行（应回业务错误 400 而非 403）、⑨ 排除清单仍被挡（`backup` / `self-uninstall` 应 403）、⑩ DSH 会话失效时导航回登录页而 XHR 仍是 401、**⑪ 1.7.0 新增的两个前缀（配置管理器 / 自由搜索设置）经门禁不再被插件 403，且无 DSH 会话时被第二层拦成 403**、**⑫ 1.7.2 新增的 `/api/market/`（应用市场客户端）同上，且该族不带 DSH 会话时确实返回 200（所以第二层不是多余的）**。**改过 `loopbackOnlyPrefixes` / `sessionRequiredPrefixes` / `marketMutationPaths` / `processControlPaths` / `clientIP` / `ModifyResponse` 后必跑**；也可带一个公网 URL 参数，走 nginx 做全链路回归 |
 | `scripts/perm-guard.sh` | **起容器前必跑**：检查数据目录里有没有容器读不到的条目（否则 DSH 崩溃重启） |
 | `scripts/set-password.sh` | 设置 / 更换口令。**只改自己那两个键**，保留 `.env` 里其它配置（1.6.0 前用截断重写，会把 TOTP 密钥一起抹掉 → 静默从双因子降级成单口令） |
 | `scripts/set-totp.sh` | 生成 TOTP 密钥；**先验证一次再写配置**，避免把自己锁在门外 |

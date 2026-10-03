@@ -51,7 +51,8 @@ for p in /api/task-board/state /api/dsh-skill-explorer/list \
 done
 
 echo "== ② 核心接口（必须不受影响：应 200）=="
-for p in /api/subagents/list /api/agentPresets/list; do
+# 0.2.0 起核心不再注册 /api/subagents/list（0.1.5 由 @deepseek-ai/dsh-subagent 提供），故只探 agentPresets
+for p in /api/agentPresets/list; do
   printf '  %-42s [%s] %s\n' "POST $p" "$(post "$p")" "$(head -c 60 /tmp/probe.out)"
 done
 printf '  %-42s [%s] %s\n' "GET /manifest.webmanifest" "$(get /manifest.webmanifest)" "$(head -c 40 /tmp/probe.out)"
@@ -182,5 +183,29 @@ else printf '  %-42s [%s] ✗ 仍被插件围栏挡住\n' "GET /api/dsh-config-m
 C=$(post /api/dsh-free-search-settings/describe)
 if [ "$C" = "403" ]; then printf '  %-42s [%s] ✗ 仍被插件围栏挡住\n' "POST /api/dsh-free-search-settings/describe" "$C"
 else printf '  %-42s [%s] ✓ 不再 403 %s\n' "POST /api/dsh-free-search-settings/describe" "$C" "$(head -c 40 /tmp/probe.out)"; fi
+
+echo "== ⑫ 1.7.2 新增前缀 /api/market/（应用市场客户端 @linxin666/dsh-client-ui-market）=="
+# 对照：该族的围栏是插件自己的 isLoopbackRequest（socket 与 Host 都得是回环），
+# **不带任何 Cookie** 也返回 200 —— 这正是「必须同时进 sessionRequiredPrefixes」的理由。
+C=$(curl -s -o /tmp/probe.out -w '%{http_code}' -H 'Host: 127.0.0.1:3082' \
+  -H 'Origin: http://127.0.0.1:3082' -H 'Sec-Fetch-Site: same-origin' "$DSH/api/market/installed")
+if [ "$C" = "200" ]; then
+  printf '  %-42s [%s] ✓ 回环无 Cookie 也放行（第二层因此必需）\n' "对照：直连回环 /api/market/installed" "$C"
+else
+  printf '  %-42s [%s] （上游行为变了，请复查围栏）%s\n' "对照：直连回环 /api/market/installed" "$C" "$(head -c 40 /tmp/probe.out)"
+fi
+C=$(curl -s -o /tmp/probe.out -w '%{http_code}' -H "Host: $HOSTHDR" -b "$GATECOOKIE" \
+  -H 'Sec-Fetch-Site: same-origin' -H "Origin: https://$HOSTHDR" -X POST -d '{}' "$GATE/api/market/installed")
+if [ "$C" = "403" ] && grep -q '需要有效的 DSH 会话' /tmp/probe.out; then
+  printf '  %-42s [%s] ✓ 第二层拦住\n' "无 DSH 会话 /api/market/installed" "$C"
+else
+  printf '  %-42s [%s] ✗ 第二层失效！%s\n' "无 DSH 会话 /api/market/installed" "$C" "$(head -c 44 /tmp/probe.out)"
+fi
+C=$(get /api/market/installed)
+if [ "$C" = "200" ]; then
+  printf '  %-42s [%s] ✓ 带 DSH 会话放行 %s\n' "GET /api/market/installed" "$C" "$(head -c 40 /tmp/probe.out)"
+else
+  printf '  %-42s [%s] ✗ 仍被插件围栏挡住\n' "GET /api/market/installed" "$C"
+fi
 
 rm -f /tmp/probe.out /tmp/admin.out /tmp/expire.out "$JAR"

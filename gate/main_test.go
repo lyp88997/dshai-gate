@@ -215,3 +215,45 @@ func TestAdminRowsCapKeepsStatsHonest(t *testing.T) {
 		t.Fatalf("最新一行应是最近的拦截，实际 %q", rows[0].Tone)
 	}
 }
+
+// 白名单注册表：这几个接口族的围栏是插件自己的「只认回环」，而**插件自己不校验
+// DSH 会话**（实测：回环身份 + 不带任何 Cookie 仍 200）。门禁呈现回环身份后，
+// 它们必须由第二层补上「需要有效的 DSH 会话」，否则等于把「门禁 + DSH 令牌」
+// 压成一层 —— 1.7.0 的配置管理器 / 自由搜索设置踩过，1.7.2 的应用市场客户端同坑。
+func TestSessionlessVerbsNeedBothLayers(t *testing.T) {
+	sessionless := []string{
+		dshSSHPrefix,             // 远端执行
+		configManagerPrefix,      // 配置管理器：导出 profile、崩溃救援
+		freeSearchSettingsPrefix, // free-search 设置桥：读写搜索服务凭据
+		marketPrefix,             // 应用市场客户端：列已装、装皮肤/预设/宠物
+	}
+	for _, prefix := range sessionless {
+		if !loopbackOnlyPath(prefix) {
+			t.Errorf("%s 没进 loopbackOnlyPrefixes：经门禁会被插件围栏 403", prefix)
+		}
+		if !sessionRequiredPath(prefix) {
+			t.Errorf("%s 缺第二层：插件自己不校验 DSH 会话，只放行回环等于压成一层", prefix)
+		}
+	}
+}
+
+// 具体请求路径要能被前缀命中；同时别把「应用市场客户端 /api/market/」和
+// 「插件市场本体 /dsh-market/（走精确表）」搞混。
+func TestMarketClientPrefixRoutes(t *testing.T) {
+	for _, p := range []string{
+		"/api/market/installed",
+		"/api/market/install-skin",
+		"/api/market/install-preset",
+		"/api/market/install-pet",
+	} {
+		if !loopbackOnlyPath(p) || !sessionRequiredPath(p) {
+			t.Errorf("%s 应同时属于回环白名单与第二层", p)
+		}
+	}
+	// 控制组：前缀带斜杠，不会误伤同形不同族的路由
+	for _, p := range []string{"/dsh-market/installed", "/api/marketing/x", "/api/market"} {
+		if loopbackOnlyPath(p) {
+			t.Errorf("%s 不该被 /api/market/ 前缀命中", p)
+		}
+	}
+}
