@@ -37,6 +37,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -58,7 +59,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.8.0"
+	gateVersion  = "1.9.0"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 
@@ -145,6 +146,18 @@ var (
 	// 顶替 github.com 与 api.github.com，否则这条流程没法在本地跑通。
 	githubOAuthBase string
 	githubAPIBase   string
+
+	// GATE_USERNAME（1.9.0）：设置后登录多一个用户名维度（用户名+口令+动态验证码）。
+	// 必须与 GATE_PASSWORD_HASH 同时配置，启动时校验。gateUserHash 是常量时间比对用的
+	// 摘要，避免每次比对裸字符串。
+	gateUser     string
+	gateUserHash string
+
+	// dshAutoKey（1.9.0）：DSH browser-session 签名密钥（GATE_DSH_SESSION_KEY，
+	// 即 .credentials.yaml 里 client-connection/browser-session 的 32 字节 base64url secret）。
+	// 配上它，门禁自己签发 dsh-auth-* 会话 Cookie——登录页不再要求用户去拿 DSH 令牌
+	// （需求②「取消网关首页的 DSH 令牌获取，改为自动获取」）。未配置时保持旧行为。
+	dshAutoKey []byte
 
 	replayMu   sync.Mutex
 	lastUsedCt uint64
@@ -964,6 +977,33 @@ func dshHasSession(r *http.Request) bool {
 	return resp.StatusCode != http.StatusUnauthorized
 }
 
+// dshAcceptsCookie 用指定 Cookie（而不是浏览器带来的）探一次 DSH。
+// 自动获取模式下签完立刻验一次：密钥配错当场报错，不把坏 Cookie 发给浏览器。
+func dshAcceptsCookie(r *http.Request, c *http.Cookie) bool {
+	if upstreamURL == nil {
+		return false
+	}
+	req, err := http.NewRequest(http.MethodGet, upstreamURL.String()+"/", nil)
+	if err != nil {
+		return false
+	}
+	req.Host = r.Host // ★ 与 dshCall 同理：DSH 按 Host 计算 Cookie 归属
+	req.Header.Set("Accept", "text/html")
+	req.Header.Set("Cookie", c.Name+"="+c.Value)
+	client := &http.Client{
+		Timeout:       8 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		secNote("探测 DSH 失败", clientIP(r), "%v", err)
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2048))
+	return resp.StatusCode != http.StatusUnauthorized
+}
+
 // dshPair 用启动令牌向 DSH 换取浏览器会话 Cookie
 func dshPair(r *http.Request, token string) (*http.Cookie, error) {
 	u := *upstreamURL
@@ -990,6 +1030,52 @@ func dshPair(r *http.Request, token string) (*http.Cookie, error) {
 	return nil, fmt.Errorf("DSH 未下发会话 Cookie")
 }
 
+// dshAuthority 复刻 DSH 侧的 requestAuthority：new URL("http://"+Host).host ——
+// 主机名小写、去掉 :80 默认端口。Cookie 名与签名 payload 都绑这个值。
+func dshAuthority(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	return strings.TrimSuffix(h, ":80")
+}
+
+// dshAutoSign 用 GATE_DSH_SESSION_KEY 自签一枚 DSH 会话 Cookie（需求②自动获取）：
+// v1.<base64url(JSON)>.<base64url(HMAC-SHA256)>，HMAC 只覆盖 body 段，
+// 与 dsh-client-connection 的 BrowserAuth 完全同构（算法已在探针上验证可签可验）。
+func dshAutoSign(r *http.Request) (*http.Cookie, error) {
+	if len(dshAutoKey) != 32 {
+		return nil, fmt.Errorf("GATE_DSH_SESSION_KEY 未配置")
+	}
+	if upstreamURL == nil {
+		return nil, fmt.Errorf("上游未就绪")
+	}
+	authority := dshAuthority(r.Host)
+	if authority == "" {
+		return nil, fmt.Errorf("Host 为空")
+	}
+	days := dshSessionDs
+	if days > 30 {
+		days = 30 // DSH 默认 maxAge 30 天；超了会被 DSH 自己拒掉
+	}
+	now := time.Now().UnixMilli()
+	payload, err := json.Marshal(map[string]any{
+		"version": 1, "authority": authority,
+		"issuedAt": now, "expiresAt": now + int64(days)*86400_000,
+	})
+	if err != nil {
+		return nil, err
+	}
+	body := base64.RawURLEncoding.EncodeToString(payload)
+	m := hmac.New(sha256.New, dshAutoKey)
+	m.Write([]byte(body))
+	sum := sha256.Sum256([]byte(authority))
+	return &http.Cookie{
+		Name:  "dsh-auth-" + base64.RawURLEncoding.EncodeToString(sum[:]),
+		Value: "v1." + body + "." + base64.RawURLEncoding.EncodeToString(m.Sum(nil)),
+		Path:  "/", MaxAge: days * 86400,
+		Expires:  time.Now().Add(time.Duration(days) * 24 * time.Hour),
+		HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	}, nil
+}
+
 // ---------- 登录页 ----------
 
 type loginView struct {
@@ -1002,9 +1088,11 @@ type loginView struct {
 	Remain       string
 	NeedPassword bool
 	NeedTOTP     bool
+	NeedUsername bool // 需求②：GATE_USERNAME 配置后多一个用户名框
 	HasGitHub    bool
 	HasSession   bool
 	TokenNeeded  bool
+	AutoPair     bool // 需求②：配了 GATE_DSH_SESSION_KEY → 不再显示令牌输入框
 }
 
 // subtitleOf / tipOf 都由「此刻实际可用的登录方式」算出来，所以后台一关掉某种
@@ -1013,10 +1101,16 @@ func subtitleOf() string {
 	pw, totp, _ := loginModes()
 	switch {
 	case pw && totp:
+		if gateUser != "" {
+			return "需要用户名 + 口令 + 动态验证码"
+		}
 		return "需要口令 + 动态验证码"
 	case totp:
 		return "需要动态验证码"
 	case pw:
+		if gateUser != "" {
+			return "需要用户名 + 口令"
+		}
 		return "需要访问口令"
 	default:
 		return "需要 GitHub 账号"
@@ -1032,6 +1126,9 @@ func tipOf() string {
 		return "受动态验证码保护 · 仅限本人使用"
 	}
 	if pw {
+		if gateUser != "" {
+			return "受用户名与口令保护 · 仅限本人使用"
+		}
 		return "受口令保护 · 仅限本人使用"
 	}
 	return "受 GitHub 账号与白名单保护 · 仅限本人使用"
@@ -1040,11 +1137,13 @@ func tipOf() string {
 // newLoginView 组装登录页数据（口令/动态码/GitHub/令牌四块由全局配置与探测结果决定）
 func newLoginView(errMsg string, locked bool, remain time.Duration, next string, hasSession bool) loginView {
 	pw, totp, gh := loginModes()
+	auto := len(dshAutoKey) == 32 // 需求②：自动获取 DSH 会话已配置 → 令牌框整个撤掉
 	return loginView{
 		Title: siteTitle, Subtitle: subtitleOf(), Tip: tipOf(),
 		Next: sanitizeNext(next), Error: errMsg, Locked: locked,
 		Remain: humanDur(remain), NeedPassword: pw, NeedTOTP: totp, HasGitHub: gh,
-		HasSession: hasSession, TokenNeeded: !hasSession,
+		HasSession: hasSession, TokenNeeded: !hasSession && !auto, AutoPair: auto,
+		NeedUsername: gateUser != "",
 	}
 }
 
@@ -1122,8 +1221,24 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 				http.Redirect(w, r, next, http.StatusSeeOther)
 				return
 			}
-			renderLogin(w, http.StatusUnauthorized,
-				"本设备还没有 DSH 会话，请在下方填写 DSH 令牌", false, 0, next, false)
+			// 需求②：自动获取（GitHub-only 模式下同样能自己签出会话）
+			if c, err := dshAutoSign(r); err == nil {
+				if !dshAcceptsCookie(r, c) {
+					secNote("自动获取失败", ip, "自签的会话 Cookie 不被 DSH 接受（GATE_DSH_SESSION_KEY 与 DSH 不匹配？）")
+					fail("自动获取 DSH 会话失败（GATE_DSH_SESSION_KEY 配置不匹配）")
+					return
+				}
+				http.SetCookie(w, c)
+				secNote("自动获取 DSH 会话", ip, "门禁自签会话 Cookie（GitHub-only 模式）")
+				http.Redirect(w, r, next, http.StatusSeeOther)
+				return
+			}
+			renderLogin(w, http.StatusUnauthorized, func() string {
+				if len(dshAutoKey) == 32 {
+					return "自动获取 DSH 会话失败（GATE_DSH_SESSION_KEY 未配置或上游未就绪）"
+				}
+				return "本设备还没有 DSH 会话，请在下方填写 DSH 令牌"
+			}(), false, 0, next, false)
 			return
 		}
 		pairCookie, err := dshPair(r, token)
@@ -1139,9 +1254,21 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if needPw {
+		// 需求②：配了 GATE_USERNAME 就先验用户名；两项合成一句提示，不透露错在哪一项
+		if gateUser != "" {
+			gotUser := hashPassword("u:" + r.FormValue("username"))
+			if subtle.ConstantTimeCompare([]byte(gotUser), []byte(gateUserHash)) != 1 {
+				fail("用户名或口令不正确")
+				return
+			}
+		}
 		got := hashPassword(r.FormValue("password"))
 		if subtle.ConstantTimeCompare([]byte(got), []byte(pwHash)) != 1 {
-			fail("口令不正确")
+			if gateUser != "" {
+				fail("用户名或口令不正确")
+			} else {
+				fail("口令不正确")
+			}
 			return
 		}
 	}
@@ -1159,14 +1286,29 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// DSH 令牌：本设备已有有效 DSH 会话时可留空；否则必须提供并当场换票配对
+	// DSH 会话：本设备已有有效会话时什么都不用做；没有则优先自动获取（需求②），
+	// 自动获取未配置时退回老路——必须提供令牌并当场换票配对。
 	token := strings.TrimSpace(r.FormValue("dstoken"))
 	if token == "" {
 		if !hasSession {
-			time.Sleep(baseDelay)
-			renderLogin(w, http.StatusUnauthorized,
-				"本设备还没有 DSH 会话，请在下方填写 DSH 令牌", false, 0, next, false)
-			return
+			if c, err := dshAutoSign(r); err == nil {
+				if !dshAcceptsCookie(r, c) {
+					secNote("自动获取失败", ip, "自签的会话 Cookie 不被 DSH 接受（GATE_DSH_SESSION_KEY 与 DSH 不匹配？）")
+					fail("自动获取 DSH 会话失败（GATE_DSH_SESSION_KEY 配置不匹配）")
+					return
+				}
+				http.SetCookie(w, c)
+				secNote("自动获取 DSH 会话", ip, "门禁自签会话 Cookie（GATE_DSH_SESSION_KEY）")
+			} else {
+				time.Sleep(baseDelay)
+				msg := "本设备还没有 DSH 会话，请在下方填写 DSH 令牌"
+				if len(dshAutoKey) == 32 {
+					// 自动获取模式下页面没有令牌框，别指向一个不存在的输入栏。
+					msg = "自动获取 DSH 会话失败（GATE_DSH_SESSION_KEY 未配置或上游未就绪）"
+				}
+				renderLogin(w, http.StatusUnauthorized, msg, false, 0, next, false)
+				return
+			}
 		}
 	} else {
 		pairCookie, err := dshPair(r, token)
@@ -1342,7 +1484,8 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
     <div class="stat"><b>全局限流</b><span>当前响应延迟 {{.Delay}}</span></div>
     <div class="stat"><b>锁定中的 IP</b><span>{{if .Locks}}{{range .Locks}}<span class="pill">{{.IP}} · 剩余 {{.Until}} · 失败 {{.Fails}} 次</span>{{end}}{{else}}无{{end}}</span></div>
     <div class="stat"><b>DSH 状态</b><span>{{if .DshUp}}<span class="badge badge-ok">正常</span>{{else}}<span class="badge badge-err">连不上</span>{{end}} · 内存内上游错误 {{.UpErrCount}} 条 · DSH 重启 {{.RestartCount}} 次</span></div>
-    <div class="stat"><b>应用市场</b><span>{{if .MarketVer}}{{.MarketVer}}{{else}}—{{end}} · 可更新 {{.UpdateCount}} 个 · 快照 {{.SnapshotCount}} 份</span></div>
+    <div class="stat"><b>应用市场</b><span>{{if .MarketVer}}{{.MarketVer}}{{else if .MarketFetching}}<span class="badge badge-info">获取中…</span>{{else}}—{{end}} · 可更新 {{.UpdateCount}} 个 · 快照 {{.SnapshotCount}} 份</span></div>
+    <div class="stat"><b>DSH 版本</b><span>{{if .DSHVer}}<span class="badge badge-ok">{{.DSHVer}}</span>{{else if .DSHVerFetching}}<span class="badge badge-info">获取中…</span>{{else}}<span class="badge badge-info">未取到</span>{{end}} · 检测结果缓存 10 分钟</span></div>
     {{if .MarketBusy}}<div class="stat"><b>市场正在跑</b><span>{{.MarketPhase}} · {{.MarketLine}}</span></div>{{end}}
   </div>
 </div>
@@ -1405,11 +1548,16 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
 </div>
 
 <div class="card">
-  <h2>插件管理（经应用市场执行；安装/更新是长任务，点完回本页看进度）</h2>
+  <details id="plugsec">
+  <summary>插件管理（经应用市场执行；安装/更新是长任务，点完回本页看进度）— 点这一行展开/收起</summary>
   <div class="restartline">
     <span class="badge badge-{{.OpTone}}">{{if .OpRunning}}{{.Op}}进行中{{else if .OpAt}}上次：{{.Op}}{{else}}还没操作过{{end}}</span>
     <span class="muted">{{if .OpAt}}{{.OpAt}} · {{.OpResult}}{{end}}</span>
     {{if .MarketBusy}}<span class="badge badge-warn">市场忙</span><span class="muted">{{.MarketPhase}} · {{.MarketLine}}</span>{{end}}
+    <form method="post" action="/__gate/market" style="display:inline">
+      <input type="hidden" name="op" value="refresh">
+      <button class="btn ghost" type="submit">{{if .MarketFetching}}正在获取…{{else}}手动检测刷新{{end}}</button>
+    </form>
   </div>
   <form method="post" action="/__gate/market" class="restartbar">
     <input type="hidden" name="op" value="install">
@@ -1424,7 +1572,7 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
     <tbody>
     {{range .Plugins}}<tr>
       <td><b>{{.Name}}</b><div class="muted" style="font-size:11.5px">{{.Spec}}</div></td>
-      <td>{{if .Updatable}}<span class="badge badge-warn">{{.Latest}} 可更新</span>{{else}}{{if $.UpdatesOK}}<span class="badge badge-ok">已最新</span>{{else}}<span class="badge badge-info">未知</span>{{end}}{{end}}</td>
+      <td>{{if .Updatable}}<span class="badge badge-warn">{{.Latest}} 可更新</span>{{else}}{{if $.UpdatesOK}}<span class="badge badge-ok">已最新</span>{{else if $.MarketFetching}}<span class="badge badge-info">获取中…</span>{{else}}<span class="badge badge-info">未知</span>{{end}}{{end}}</td>
       <td>{{if .Disabled}}<span class="badge badge-info">已停用</span>{{else}}<span class="badge badge-ok">启用中</span>{{end}}</td>
       <td style="white-space:nowrap;text-align:right">
         <form method="post" action="/__gate/market" style="display:inline">
@@ -1448,8 +1596,10 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
     {{end}}
     </tbody>
   </table></div>
+  {{else if .MarketFetching}}<p class="empty">正在获取插件列表…（取到后本页会自动刷新显示）</p>
   {{else}}<p class="empty">{{if .PluginsErr}}{{.PluginsErr}}{{else}}没有读到插件列表{{end}}</p>{{end}}
   <p class="muted">装完/更完多数要重启 DSH 才生效（页顶「重启 DSH」）。被市场拒绝时，这一行会直接写出原因；每次操作也会记进安全日志。</p>
+  </details>
 </div>
 
 <div class="card">
@@ -1521,6 +1671,10 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
   var hs=document.getElementById('histsec');
   if(ls('dshai_admin_hist_open')==='1'){ hs.open=true; }
   hs.addEventListener('toggle',function(){ ls('dshai_admin_hist_open', hs.open?'1':'0'); });
+  // 插件管理默认折叠（1.9.0）；用户手动展开过就记住，刷新/自动重载不打断他。
+  var ps=document.getElementById('plugsec');
+  if(ls('dshai_admin_plug_open')==='1'){ ps.open=true; }
+  ps.addEventListener('toggle',function(){ ls('dshai_admin_plug_open', ps.open?'1':'0'); });
   var tbl=document.getElementById('logtable'), chips=document.querySelectorAll('.logtool .chip'), hint=document.getElementById('logfilterhint');
   function applyFilter(f){
     if(f!=='bad'){ f='all'; }
@@ -1545,11 +1699,14 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
   Array.prototype.forEach.call(document.querySelectorAll('form input'), function(el){
     if(el!==box){ el.addEventListener('input', function(){ dirty=true; }); }
   });
+  // 市场/DSH 版本还在「获取中」时把自动刷新从 10 秒提到 3 秒：数据一到用户
+  // 很快看到，取完（或取失败的 30 秒缓存期内）立刻回到 10 秒，不空转。
+  var busy={{if or .MarketFetching .DSHVerFetching}}1{{else}}0{{end}};
   setInterval(function(){
     if(!on || dirty){ return; }
     if(document.querySelector('input:focus,textarea:focus')){ return; }
     location.reload();
-  }, 10000);
+  }, busy?3000:10000);
 })();
 </script>
 </body>
@@ -1632,6 +1789,11 @@ type adminView struct {
 	MarketBusy    bool   // 市场正在跑长任务（装/更）
 	MarketPhase   string
 	MarketLine    string
+	MarketFetching bool  // 正在后台重拉市场（1.9.0：页面显示「获取中」，不阻塞）
+
+	// DSH 版本检测（1.9.0：为更新功能铺路；缓存 10 分钟）
+	DSHVer         string
+	DSHVerFetching bool
 
 	// 插件管理
 	Plugins    []pluginRow
@@ -2076,6 +2238,17 @@ func handleMarket(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.FormValue("name"))
 	var body map[string]any
 	switch op {
+	case "refresh":
+		// 手动检测刷新（1.9.0）：丢弃市场/版本缓存，当场同步重检一遍再回页，
+		// 用户点一下就立刻看到新结果，不等后台轮询。
+		marketInvalidate()
+		dshVerInvalidate()
+		marketRefreshNow()
+		dshVersionRefreshNow(r.Host, dshCookieFor(r))
+		secNote("插件操作", ip, "手动检测刷新")
+		setAdminMsg("已重新检测：插件列表、更新情况和 DSH 版本都取了最新。")
+		backToAdmin(w, r)
+		return
 	case "install":
 		u := strings.TrimSpace(r.FormValue("url"))
 		if !validInstallURL(u) {
@@ -2157,6 +2330,9 @@ func handleMarket(w http.ResponseWriter, r *http.Request) {
 // dshGetJSON 给上游发一次只读 GET 并解 JSON。Host 取上游回环地址
 // （http.NewRequest 默认就用 URL 里的 Host），与经反代转发时的身份一致。
 func dshGetJSON(path string, timeout time.Duration, out any) error {
+	if upstreamURL == nil {
+		return fmt.Errorf("上游未配置")
+	}
 	u := *upstreamURL
 	u.Path = path
 	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
@@ -2180,6 +2356,7 @@ func dshGetJSON(path string, timeout time.Duration, out any) error {
 type marketReadInfo struct {
 	ok         bool
 	at         time.Time
+	fetching   bool // 正在后台重拉（页面显示「获取中」，不阻塞渲染）
 	ver        string
 	sumOK      bool // 更新摘要这次拉到了吗（false 时不能说「已最新」）
 	updatable  int
@@ -2190,8 +2367,9 @@ type marketReadInfo struct {
 }
 
 var marketRead struct {
-	mu   sync.Mutex
-	info marketReadInfo
+	mu       sync.Mutex
+	info     marketReadInfo
+	fetching bool // 已有后台重拉在跑（单飞）
 }
 
 const marketReadTTL = 30 * time.Second
@@ -2203,22 +2381,45 @@ func marketInvalidate() {
 	marketRead.mu.Unlock()
 }
 
-// marketReadSnapshot 返回缓存的市场只读信息；过期则现场重拉。
-// 重拉失败不抛错：能用旧值用旧值，用不了就在页面上写「拉取失败」——
-// 体检面板永远不该把整张后台页拖垮。
+// marketReadSnapshot 返回缓存的市场只读信息；过期时**不阻塞页面**：先回旧值
+// （没有旧值就回空值 + fetching），再后台单飞重拉——后台页永远不该因为市场
+// 慢而整页转圈。下一次渲染（页面 2 秒自动刷新或点手动检测）自然拿到新值。
 func marketReadSnapshot() marketReadInfo {
 	marketRead.mu.Lock()
 	stale := !marketRead.info.ok || time.Since(marketRead.info.at) > marketReadTTL
 	info := marketRead.info
-	marketRead.mu.Unlock()
-	if !stale {
-		return info
+	if stale {
+		info.fetching = true
+		if !marketRead.fetching {
+			marketRead.fetching = true
+			go func() {
+				ni := refreshMarketRead()
+				marketRead.mu.Lock()
+				marketRead.info = ni
+				marketRead.fetching = false
+				marketRead.mu.Unlock()
+			}()
+		}
 	}
-	info = refreshMarketRead()
-	marketRead.mu.Lock()
-	marketRead.info = info
 	marketRead.mu.Unlock()
 	return info
+}
+
+// marketRefreshNow 同步重拉一次（「手动检测刷新」按钮用）：用户点了按钮就在这
+// 一次请求里等结果，回页立刻是新的；与后台单飞互斥，别人在拉就直接返回。
+func marketRefreshNow() {
+	marketRead.mu.Lock()
+	if marketRead.fetching {
+		marketRead.mu.Unlock()
+		return
+	}
+	marketRead.fetching = true
+	marketRead.mu.Unlock()
+	ni := refreshMarketRead()
+	marketRead.mu.Lock()
+	marketRead.info = ni
+	marketRead.fetching = false
+	marketRead.mu.Unlock()
 }
 
 type mktStatus struct {
@@ -2339,6 +2540,139 @@ func marketStatusNow() (mktStatus, string) {
 	return st, errStr
 }
 
+// ---------- DSH 版本检测（1.9.0：为将来的更新功能铺路） ----------
+//
+// DSH 没有任何版本 API，版本号只烤在前端构建里，只能两步抓：① 拿首页，
+// 正则出设置页脚本地址（带 rev 指纹，少了 rev 那个地址直接 404）；② 抓
+// 那个脚本，读 currentVersion 的 version 字段。结果缓存 10 分钟、后台单飞
+// 刷新，页面只读缓存 —— 版本检测绝不能拖慢后台页。
+
+const dshVerTTL = 10 * time.Minute
+
+// 两个正则与 DSH 前端构建产物对齐（0.2.0-rc.2 实测通过）。
+var (
+	dshUIBundleRe = regexp.MustCompile(`plugins/(\?\?@deepseek-ai/dsh-client-ui-settings-general/client\.js&rev=[0-9a-f]+)`)
+	dshUIVerRe    = regexp.MustCompile(`currentVersion", \{ version: "([^"]+)"`)
+)
+
+var dshVerRead struct {
+	mu       sync.Mutex
+	ver      string
+	at       time.Time // 上次尝试时间（失败也更新，按 TTL 退避不打爆上游）
+	fetching bool
+}
+
+// dshCookieFor 给版本检测用的 Cookie：优先门禁自签（不依赖浏览器状态，
+// GATE_DSH_SESSION_KEY 配了就够），没配就借浏览器带来的整串 Cookie。
+func dshCookieFor(r *http.Request) string {
+	if c, err := dshAutoSign(r); err == nil {
+		return c.Name + "=" + c.Value
+	}
+	return r.Header.Get("Cookie")
+}
+
+// dshDetectVersion 现场检测一次 DSH 版本（两步抓前端构建文件）。
+// host/cookie 是算好的字符串：后台协程不碰 *http.Request。
+func dshDetectVersion(host, cookie string) (string, error) {
+	if upstreamURL == nil {
+		return "", fmt.Errorf("上游未配置")
+	}
+	if cookie == "" {
+		return "", fmt.Errorf("没有可用的 DSH 会话")
+	}
+	fetch := func(rawurl string) ([]byte, error) {
+		req, err := http.NewRequest(http.MethodGet, rawurl, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Host = host // ★ 与 dshCall 同理：DSH 按 Host 计算 Cookie 归属
+		req.Header.Set("Cookie", cookie)
+		client := &http.Client{
+			Timeout:       8 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("DSH 返回 %d", resp.StatusCode)
+		}
+		return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	}
+	home, err := fetch(upstreamURL.String() + "/")
+	if err != nil {
+		return "", err
+	}
+	m := dshUIBundleRe.FindSubmatch(home)
+	if m == nil {
+		return "", fmt.Errorf("首页里没找到设置页脚本地址")
+	}
+	// m[1] 以 "??@…" 开头：整串拼回 URL 里，第一个 ? 自然成为查询串分隔符，
+	// 发出去的请求行与浏览器一字不差（少了 rev 就是 404）。
+	js, err := fetch(upstreamURL.String() + "/plugins/" + string(m[1]))
+	if err != nil {
+		return "", err
+	}
+	v := dshUIVerRe.FindSubmatch(js)
+	if v == nil {
+		return "", fmt.Errorf("脚本里没找到版本号")
+	}
+	return string(v[1]), nil
+}
+
+// dshVersionSnapshot 返回缓存的 DSH 版本号；过期则后台单飞重检（不阻塞页面）。
+// 返回 (版本, 是否正在检测)。
+func dshVersionSnapshot(host, cookie string) (string, bool) {
+	dshVerRead.mu.Lock()
+	stale := dshVerRead.at.IsZero() || time.Since(dshVerRead.at) > dshVerTTL
+	ver, fetching := dshVerRead.ver, dshVerRead.fetching
+	if stale && !fetching {
+		dshVerRead.fetching = true
+		fetching = true
+		go func() {
+			v, err := dshDetectVersion(host, cookie)
+			dshVerRead.mu.Lock()
+			if err == nil && v != "" {
+				dshVerRead.ver = v
+			}
+			dshVerRead.at = time.Now()
+			dshVerRead.fetching = false
+			dshVerRead.mu.Unlock()
+		}()
+	}
+	dshVerRead.mu.Unlock()
+	return ver, fetching
+}
+
+// dshVerInvalidate 让下一次取版本立刻重检（手动检测刷新用）。
+func dshVerInvalidate() {
+	dshVerRead.mu.Lock()
+	dshVerRead.at = time.Time{}
+	dshVerRead.mu.Unlock()
+}
+
+// dshVersionRefreshNow 同步重检一次（手动检测按钮用）：点了按钮就在这一次
+// 请求里等结果，回页立刻是新的；与后台单飞互斥。
+func dshVersionRefreshNow(host, cookie string) {
+	dshVerRead.mu.Lock()
+	if dshVerRead.fetching {
+		dshVerRead.mu.Unlock()
+		return
+	}
+	dshVerRead.fetching = true
+	dshVerRead.mu.Unlock()
+	v, err := dshDetectVersion(host, cookie)
+	dshVerRead.mu.Lock()
+	if err == nil && v != "" {
+		dshVerRead.ver = v
+	}
+	dshVerRead.at = time.Now()
+	dshVerRead.fetching = false
+	dshVerRead.mu.Unlock()
+}
+
 func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	evs, total := secSnapshot()
 	rows, nBad, nWarn, nOK, nInfo := buildRows(evs)
@@ -2360,6 +2694,8 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	// 体检数据：市场只读信息走 30 秒缓存、进度走 5 秒缓存，都是给完超时就认输
 	// （写「拉取失败」照常出页）—— 体检卡绝不能把整张后台页拖死。
 	mkt := marketReadSnapshot()
+	// DSH 版本：缓存 10 分钟、过期后台单飞重检，页面只读缓存（1.9.0）。
+	dshVer, dshVerFetching := dshVersionSnapshot(r.Host, dshCookieFor(r))
 	st, stErr := marketStatusNow()
 	opRunning, op, opAt, opResult := marketOpSnapshot()
 	histQuery := r.URL.Query().Get("q")
@@ -2421,7 +2757,9 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 		UpErrCount: upErrs, RestartCount: restarts,
 		MarketVer: mkt.ver, UpdateCount: mkt.updatable, UpdatesOK: mkt.sumOK, SnapshotCount: mkt.snaps,
 		MarketBusy: st.Busy, MarketPhase: st.Phase, MarketLine: marketLine,
-		Plugins:     mkt.plugins, PluginsErr: mkt.pluginsErr,
+		MarketFetching: mkt.fetching,
+		DSHVer:         dshVer, DSHVerFetching: dshVerFetching,
+		Plugins:        mkt.plugins, PluginsErr: mkt.pluginsErr,
 		OpRunning: opRunning, Op: op, OpAt: opAt, OpResult: opResult, OpTone: opTone,
 		LogPath: logPath, LogSize: logSize, LogRotate: logRotate,
 		Hist: hist, HistShown: len(hist), HistQuery: histQuery, HistCap: histRowsMax,
@@ -2825,6 +3163,11 @@ func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 	setCookie(w, r, cookieName, val, maxAge)
 	if dshHasSession(r) {
 		stampDSHSession(w, r)
+	} else if c, err := dshAutoSign(r); err == nil && dshAcceptsCookie(r, c) {
+		// 需求②：GitHub 登录成功后本机没有 DSH 会话时，门禁直接自签一枚
+		http.SetCookie(w, c)
+		stampDSHSession(w, r)
+		secNote("自动获取 DSH 会话", ip, "门禁自签会话 Cookie（GitHub 登录后）")
 	}
 	secNote("登录成功", ip, "方式=GitHub(%s)", id.Login)
 	http.Redirect(w, r, next, http.StatusSeeOther)
@@ -3428,6 +3771,26 @@ func main() {
 	}
 	githubOAuthBase = strings.TrimSuffix(env("GATE_GITHUB_OAUTH_BASE", "https://github.com"), "/")
 	githubAPIBase = strings.TrimSuffix(env("GATE_GITHUB_API_BASE", "https://api.github.com"), "/")
+
+	// 需求②（1.9.0）：用户名维度 + DSH 会话自动获取。
+	// GATE_USERNAME 必须与 GATE_PASSWORD_HASH 同配 —— 只写用户名没口令没有意义。
+	gateUser = strings.TrimSpace(os.Getenv("GATE_USERNAME"))
+	if gateUser != "" {
+		if !needPw {
+			log.Fatal("门禁配置错误：GATE_USERNAME 需要同时配置 GATE_PASSWORD_HASH（用户名必须配口令）")
+		}
+		gateUserHash = hashPassword("u:" + gateUser)
+	}
+	// GATE_DSH_SESSION_KEY：.credentials.yaml 里 client-connection/browser-session 的
+	// 32 字节 base64url secret（可带 = padding）。配上后门禁自己签 dsh-auth-* Cookie，
+	// 登录页不再显示 DSH 令牌输入框；配错只在实际换会话时暴露（探活 401），启动不拦。
+	if k := strings.TrimSpace(os.Getenv("GATE_DSH_SESSION_KEY")); k != "" {
+		b, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(k, "="))
+		if err != nil || len(b) != 32 {
+			log.Fatal("门禁配置错误：GATE_DSH_SESSION_KEY 必须是 base64url 编码的 32 字节 secret（取自 .credentials.yaml 的 client-connection/browser-session）")
+		}
+		dshAutoKey = b
+	}
 
 	// 后台可改的配置（落盘）。放在 fail-closed 之前：GitHub 登录就是在后台开的，
 	// 关掉动态密码后能不能启动，取决于这个文件读得读不出来。

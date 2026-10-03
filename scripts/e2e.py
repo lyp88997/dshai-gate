@@ -8,7 +8,10 @@
      后台体检页、插件操作转发（第二层）、踢光设备（会话代数）；
   2. 既有回归——未登录 401、口令登录、401 换登录页、回环身份改写、
      点段不给回环、XFF 追加与 restart 剥离、市场 20 写路由第二层、
-     市场读路由不进第二层、101 升级直通。
+     市场读路由不进第二层、101 升级直通；
+  3. 四项 1.9.0 新需求（第二个门禁实例）——用户名+口令+动态验证码登录、
+     登录页撤掉 DSH 令牌框、自动获取 DSH 会话、插件状态「获取中」与
+     手动检测刷新、插件管理默认折叠、DSH 版本检测 0.2.0-rc.2 与缓存提示。
 
 用法（在仓库根目录）：
     python3 scripts/e2e.py
@@ -90,6 +93,8 @@ class StubHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         sp = urlsplit(self.path)
+        if sp.path in SLOW_PATHS:
+            time.sleep(1.0)
         if sp.path == "/":
             if "token=" in (sp.query or ""):  # dshPair 换票
                 self.send_response(303)
@@ -98,10 +103,20 @@ class StubHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            if "dsh-auth-e2e" in (self.headers.get("Cookie") or ""):
-                self._text(200, "dsh ok")
+            # 1.9.0：认任意 dsh-auth-* 前缀（门禁自签的 Cookie 名是
+            # dsh-auth-<哈希>，不是固定 dsh-auth-e2e）；首页同时带出
+            # 版本检测要抓的前端包引用（需求④）。
+            if "dsh-auth-" in (self.headers.get("Cookie") or ""):
+                self._text(200, '<html><body>dsh ok<script src="/plugins/'
+                                '??@deepseek-ai/dsh-client-ui-settings-general'
+                                '/client.js&rev=53b18d3f3f48"></script></body></html>')
             else:
                 self._text(401, "no dsh session")
+            return
+        if "dsh-client-ui-settings-general/client.js" in self.path:
+            # 需求④：版本检测第二步抓的前端包 —— DSH 自报版本号
+            self._text(200, 'children: t("general.currentVersion", '
+                            '{ version: "0.2.0-rc.2" })')
             return
         if sp.path == "/auth-required":  # 触发门禁 401 换登录页
             body = b"<html><body>upstream-401-page</body></html>"
@@ -156,6 +171,11 @@ class StubHandler(BaseHTTPRequestHandler):
 
 STUB_POSTS = []
 STUB_LOCK = threading.Lock()
+# 1.9.0 需求①：市场只读三路故意放慢，首屏「获取中」状态才有确定观测窗口。
+# /dsh-market/status 走 5 秒同步小缓存，不放慢，免得拖累每次后台页响应。
+SLOW_PATHS = {"/dsh-market/api/v1/updates/summary",
+              "/dsh-market/installed",
+              "/dsh-market/snapshots"}
 
 
 class Stub:
@@ -214,6 +234,16 @@ def poll(desc, fn, timeout=8, interval=0.3):
             return v
         time.sleep(interval)
     return None
+
+
+def totp_now(secret_b32, offset=0):
+    """RFC6238：SHA1 / 30 秒 / 6 位，与门禁 verifyTOTP 对齐；offset 以时间片计。"""
+    key = base64.b32decode(secret_b32)
+    counter = int(time.time() // 30) + offset
+    mac = hmac.new(key, counter.to_bytes(8, "big"), hashlib.sha1).digest()
+    off = mac[-1] & 0x0F
+    val = (int.from_bytes(mac[off:off + 4], "big") & 0x7FFFFFFF) % 1000000
+    return f"{val:06d}"
 
 
 def hist_kinds():
@@ -299,7 +329,7 @@ def main():
     try:
         wait_listen()
 
-        print("== 1.8.0 e2e 测试台 ==")
+        print("== dshai-gate e2e 测试台（1.8.0 回归 + 1.9.0 新需求）==")
         # ---- 未登录 ----
         st, _, _ = call("GET", "/")
         check("未登录导航 → 401", st == 401, f"实际 {st}")
@@ -481,6 +511,128 @@ def main():
                   timeout=8)
         check("巡检恢复记「DSH 重启」", ev is not None)
 
+        # ============ 1.9.0 新需求（换第二个门禁实例） ============
+        # 需求② 用户名+口令+动态验证码登录、登录页撤令牌框、自动获取 DSH 会话；
+        # 需求① 插件状态「获取中」与手动检测刷新；需求③ 插件管理默认折叠；
+        # 需求④ DSH 版本检测 0.2.0-rc.2 + 「缓存 10 分钟」提示。
+        print("== 1.9.0 e2e 测试台（第二实例） ==", flush=True)
+        gate.terminate()
+        try:
+            gate.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            gate.kill()
+        glog.close()
+
+        TOTP_SECRET = "JBSWY3DPEHPK3PXP"  # base32，RFC6238 动态验证码
+        DSH_KEY = base64.urlsafe_b64encode(
+            b"e2e-dsh-session-key-0123456789ab").rstrip(b"=").decode()
+        GATE_PORT = free_port()
+        HIST_PATH = os.path.join(workdir, "log2.jsonl")
+        env.update({
+            "GATE_LISTEN": f"127.0.0.1:{GATE_PORT}",
+            "GATE_USERNAME": "e2e-user",
+            "GATE_TOTP_SECRET": TOTP_SECRET,
+            "GATE_DSH_SESSION_KEY": DSH_KEY,
+            "GATE_SESSION_SECRET": SECRET + "-two",
+            "GATE_STATE": os.path.join(workdir, "state2.json"),
+            "GATE_LOG": HIST_PATH,
+            "GATE_HEALTH_INTERVAL": "0",  # 巡检第一实例已测过；第二实例只测登录/后台
+        })
+        glog = open(os.path.join(workdir, "gate2.log"), "wb")
+        gate = subprocess.Popen([binary], env=env, stdout=glog, stderr=subprocess.STDOUT)
+        wait_listen()
+
+        CT = {"Content-Type": "application/x-www-form-urlencoded",
+              "Accept": "text/html"}
+
+        # ---- 登录页：三要素、令牌框已撤（需求②） ----
+        st, _, body = call("GET", "/__gate/login", headers={"Accept": "text/html"})
+        page = body.decode("utf-8", "replace")
+        check("登录页出现用户名框", 'name="username"' in page)
+        check("登录页出现验证码框", 'name="code"' in page)
+        # html/template 会把 + 转义成 &#43;，先还原再比对
+        small = (page.split("<small>", 1)[1].split("</small>", 1)[0]
+                 .replace("&#43;", "+") if "<small>" in page else "")
+        check("副标题点名三要素",
+              small == "需要用户名 + 口令 + 动态验证码", small)
+        check("登录页撤掉 DSH 令牌框", 'name="dstoken"' not in page)
+        check("登录页撤掉取令牌命令", "data-copy=" not in page)
+
+        # ---- 用户名错 ----
+        form = urlencode({"username": "nobody", "password": PASSWORD,
+                          "code": totp_now(TOTP_SECRET)})
+        st, _, body = call("POST", "/__gate/login", body=form, headers=CT)
+        page = body.decode("utf-8", "replace")
+        check("用户名错 → 401 合并提示",
+              st == 401 and "用户名或口令不正确" in page, f"status={st}")
+
+        # ---- 验证码错（挑一个当前 ±1 时间片都不认的码） ----
+        win = {totp_now(TOTP_SECRET, o) for o in (-1, 0, 1)}
+        wrong = next(c for c in ("000000", "111111", "123456") if c not in win)
+        form = urlencode({"username": "e2e-user", "password": PASSWORD, "code": wrong})
+        st, _, body = call("POST", "/__gate/login", body=form, headers=CT)
+        page = body.decode("utf-8", "replace")
+        check("验证码错 → 401 合并提示",
+              st == 401 and "口令或动态验证码不正确" in page, f"status={st}")
+
+        # ---- 正确三要素登录：自动获取 DSH 会话（需求②） ----
+        form = urlencode({"username": "e2e-user", "password": PASSWORD,
+                          "code": totp_now(TOTP_SECRET)})
+        st, hdr, _ = call("POST", "/__gate/login", body=form, headers=CT)
+        n2 = extract_cookie(hdr, "dshai_gate")
+        sc = hdr.get("Set-Cookie", "") or ""
+        dsa = next((ln.strip().split(";")[0] for ln in sc.split("\n")
+                    if ln.strip().startswith("dsh-auth-")), None)
+        check("三要素登录 → 303", st == 303, f"status={st}")
+        check("下发门禁 Cookie", n2 is not None, sc[:120])
+        check("自动获取的 DSH 会话是 v1. 三段式",
+              dsa is not None and "=v1." in dsa, sc[:200])
+        st, _, body = call("GET", "/", cookie="; ".join(x for x in [n2, dsa] if x))
+        check("自动获取的会话真过上游", st == 200 and b"dsh ok" in body, f"status={st}")
+
+        # ---- 后台页：获取中（①）→ 默认折叠（③）→ 版本（④） ----
+        st, _, body = call("GET", "/__gate/admin", cookie=n2 or "",
+                           headers={"Accept": "text/html"})
+        page = body.decode("utf-8", "replace")
+        check("首屏不被市场拉取卡住", st == 200, f"status={st}")
+        check("插件状态「获取中」而非「未知」（需求①）", "获取中" in page, "")
+        check("插件管理卡默认折叠（需求③）",
+              '<details id="plugsec"' in page and '<details id="plugsec" open' not in page,
+              "")
+
+        def admin2():
+            s, _, b = call("GET", "/__gate/admin", cookie=n2 or "",
+                           headers={"Accept": "text/html"})
+            return b.decode("utf-8", "replace") if s == 200 else ""
+
+        def got_final():
+            p = admin2()
+            return p if ("0.2.0-rc.2" in p and "手动检测刷新" in p) else None
+
+        page = poll("版本检测与手动刷新按钮", got_final, timeout=10)
+        check("DSH 版本检测出 0.2.0-rc.2（需求④）",
+              page is not None and "0.2.0-rc.2" in page, "")
+        check("版本行注明缓存 10 分钟",
+              page is not None and "缓存 10 分钟" in page, "")
+        check("手动检测刷新按钮（需求①）",
+              page is not None and "手动检测刷新" in page, "")
+
+        # ---- 手动检测刷新 ----
+        st, _, _ = call("POST", "/__gate/market", cookie=n2 or "",
+                        body=urlencode({"op": "refresh"}), headers=CT)
+        check("手动检测刷新 → 303", st == 303, f"status={st}")
+        p3 = admin2()
+        check("刷新后横幅提示已重新检测", "已重新检测" in p3, "")
+        check("刷新后版本仍展示 0.2.0-rc.2", "0.2.0-rc.2" in p3, "")
+        ev = poll("自动获取会话日志",
+                  lambda: any(e.get("kind") == "自动获取 DSH 会话"
+                              for e in hist_kinds()), timeout=4)
+        check("自动获取记进历史日志", ev is not None)
+        ev = poll("手动检测刷新日志",
+                  lambda: any(e.get("kind") == "插件操作" for e in hist_kinds()),
+                  timeout=4)
+        check("手动检测刷新记进历史日志", ev is not None)
+
     finally:
         gate.terminate()
         try:
@@ -497,13 +649,14 @@ def main():
     total = len(results)
     print(f"\n结果：{passed}/{total} 通过", flush=True)
     if passed != total:
-        print("—— 门禁日志尾部 ——", flush=True)
-        try:
-            with open(os.path.join(workdir, "gate.log"), "rb") as f:
-                data = f.read()[-4000:]
-            print(data.decode("utf-8", "replace"), flush=True)
-        except OSError:
-            pass
+        for lg in ("gate.log", "gate2.log"):
+            print(f"—— {lg} 尾部 ——", flush=True)
+            try:
+                with open(os.path.join(workdir, lg), "rb") as f:
+                    data = f.read()[-4000:]
+                print(data.decode("utf-8", "replace"), flush=True)
+            except OSError:
+                pass
         sys.exit(1)
 
 

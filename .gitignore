@@ -6,6 +6,7 @@ workspaces/
 home/
 gate-data/
 .dsh/
+__pycache__/
 *.bak-*
 *.tgz
 *.log

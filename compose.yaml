@@ -60,7 +60,7 @@ services:
 
   gate:
     build: ./gate
-    image: dsh-gate:1.8.0
+    image: dsh-gate:1.9.0
     container_name: dshai-gate
     restart: unless-stopped
     network_mode: host
@@ -82,6 +82,14 @@ services:
       - GATE_PASSWORD_HASH=${GATE_PASSWORD_HASH}
       - GATE_TOTP_SECRET=${GATE_TOTP_SECRET}
       - GATE_SESSION_SECRET=${GATE_SESSION_SECRET}
+      # 1.9.0 三要素登录：用户名。留空 = 不要用户名框（保持旧行为）；
+      # 要用则必须同时配 GATE_PASSWORD_HASH，否则门禁拒绝启动。
+      - GATE_USERNAME=${GATE_USERNAME:-}
+      # 1.9.0 DSH 会话自动获取：DSH `.credentials.yaml` 里
+      # client-connection/browser-session 的 32 字节 secret（base64url，43 字符）。
+      # 配上后登录页不再显示「DSH 令牌」框，登录时门禁自己向 DSH 换会话；
+      # 留空 = 保持旧行为（手工粘贴令牌）。
+      - GATE_DSH_SESSION_KEY=${GATE_DSH_SESSION_KEY:-}
       # 日志与后台页时间跟随本地时区。gate 镜像基于 alpine（无 zoneinfo），时区库由
       # gate/main.go 里的 `_ "time/tzdata"` 内嵌；不设 TZ 会退回 UTC，页面时间早 8 小时
       # （2026-09-27 实测：宿主 18:45:35 CST 而容器 10:45:35 UTC）。

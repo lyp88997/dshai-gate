@@ -1,8 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
 	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -525,5 +533,220 @@ func TestMarketResultText(t *testing.T) {
 	got := marketResultText(400, `{"error":"plugin is not installed"}`)
 	if !strings.Contains(got, "HTTP 400") || !strings.Contains(got, "plugin is not installed") {
 		t.Errorf("失败应同时带状态码与错误正文，实际 %q", got)
+	}
+}
+
+// ==================== 1.9.0 新功能 ====================
+
+// 需求②：配了 GATE_DSH_SESSION_KEY 后登录页撤掉令牌框；没配保持老样子。
+// 令牌框（name="dstoken"）与取令牌命令（data-copy=）必须同进同出。
+func TestLoginAutoPairHidesTokenField(t *testing.T) {
+	auto := string(loginBytes(loginView{Title: "t", AutoPair: true}))
+	old := string(loginBytes(loginView{Title: "t", AutoPair: false, TokenNeeded: true}))
+	if strings.Contains(auto, `name="dstoken"`) {
+		t.Error("自动获取模式下登录页不该再出现 DSH 令牌输入框")
+	}
+	if strings.Contains(auto, "data-copy=") {
+		t.Error("自动获取模式下不该再展示取令牌命令")
+	}
+	if !strings.Contains(old, `name="dstoken"`) || !strings.Contains(old, "data-copy=") {
+		t.Error("未配置自动获取时必须保留令牌输入框与取令牌命令（老行为）")
+	}
+}
+
+// 需求②：GATE_USERNAME 配置后多一个用户名框，且与口令框同真同假之外独立存在。
+func TestLoginUsernameField(t *testing.T) {
+	with := string(loginBytes(loginView{Title: "t", NeedUsername: true, NeedPassword: true}))
+	without := string(loginBytes(loginView{Title: "t", NeedUsername: false, NeedPassword: true}))
+	if n := strings.Count(with, `id="username"`); n != 1 {
+		t.Errorf("配了 GATE_USERNAME 应恰有 1 个用户名框，实际 %d", n)
+	}
+	if strings.Contains(without, `id="username"`) {
+		t.Error("没配 GATE_USERNAME 不该出现用户名框")
+	}
+}
+
+// 需求②：自签的 DSH 会话 Cookie 必须与 BrowserAuth 同构 ——
+// 名字绑 authority 的 sha256，值是 v1.<body>.<sig>，HMAC 只覆盖 body。
+func TestDshAutoSignShape(t *testing.T) {
+	oldKey, oldUp, oldDays := dshAutoKey, upstreamURL, dshSessionDs
+	t.Cleanup(func() { dshAutoKey, upstreamURL, dshSessionDs = oldKey, oldUp, oldDays })
+	dshAutoKey = make([]byte, 32)
+	for i := range dshAutoKey {
+		dshAutoKey[i] = byte(i)
+	}
+	dshSessionDs = 30 // 只有 main() 里才解析 GATE_DSH_SESSION_DAYS，单测里自己给上
+	u, err := url.Parse("http://127.0.0.1:3082")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamURL = u
+	r, _ := http.NewRequest(http.MethodGet, "http://harness.mzlp.eu.org/", nil)
+	r.Host = "Harness.mzlp.eu.org"
+	c, err := dshAutoSign(r)
+	if err != nil {
+		t.Fatalf("dshAutoSign 失败：%v", err)
+	}
+	if !strings.HasPrefix(c.Name, "dsh-auth-") {
+		t.Errorf("Cookie 名应以 dsh-auth- 开头，实际 %q", c.Name)
+	}
+	wantName := func(authority string) string {
+		s := sha256.Sum256([]byte(authority))
+		return "dsh-auth-" + base64.RawURLEncoding.EncodeToString(s[:])
+	}
+	if c.Name != wantName("harness.mzlp.eu.org") {
+		t.Errorf("Cookie 名应绑小写权威主机，期望 %q，实际 %q", wantName("harness.mzlp.eu.org"), c.Name)
+	}
+	parts := strings.Split(c.Value, ".")
+	if len(parts) != 3 || parts[0] != "v1" {
+		t.Fatalf("值应为 v1.<body>.<sig> 三段，实际 %q", c.Value)
+	}
+	mac := hmac.New(sha256.New, dshAutoKey)
+	mac.Write([]byte(parts[1]))
+	if want := base64.RawURLEncoding.EncodeToString(mac.Sum(nil)); subtle.ConstantTimeCompare([]byte(want), []byte(parts[2])) != 1 {
+		t.Error("HMAC 必须只覆盖 body 段且与密钥一致（DSH 侧要能验过）")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("body 不是 base64url：%v", err)
+	}
+	var p struct {
+		Version   int    `json:"version"`
+		Authority string `json:"authority"`
+		IssuedAt  int64  `json:"issuedAt"`
+		ExpiresAt int64  `json:"expiresAt"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		t.Fatalf("payload 解析失败：%v", err)
+	}
+	if p.Version != 1 || p.Authority != "harness.mzlp.eu.org" {
+		t.Errorf("payload version/authority 不对：%+v", p)
+	}
+	if p.ExpiresAt <= p.IssuedAt {
+		t.Errorf("expiresAt 应晚于 issuedAt：%+v", p)
+	}
+}
+
+// 需求④：两个正则必须与 DSH 0.2.0-rc.2 的真实前端构建产物对齐，
+// 版本检测整条链路就靠它们；样本取自线上实测的页面与脚本片段。
+func TestDshVersionRegexes(t *testing.T) {
+	home := `<script src="/plugins/??@deepseek-ai/dsh-client-ui-settings-general/client.js&rev=53b18d3f3f48"></script>`
+	m := dshUIBundleRe.FindStringSubmatch(home)
+	if m == nil {
+		t.Fatalf("首页样本没匹配到设置页脚本地址：%q", home)
+	}
+	if m[1] != "??@deepseek-ai/dsh-client-ui-settings-general/client.js&rev=53b18d3f3f48" {
+		t.Errorf("捕获段应含 ??@ 前缀与 rev，实际 %q", m[1])
+	}
+	js := `children: t("general.currentVersion", { version: "0.2.0-rc.2" })`
+	v := dshUIVerRe.FindStringSubmatch(js)
+	if v == nil || v[1] != "0.2.0-rc.2" {
+		t.Errorf("版本正则没从脚本样本里解出 0.2.0-rc.2，实际 %v", v)
+	}
+	// rev 缺失/格式不对就不该抓到（抓到 = 会去请求一个必然 404 的地址）。
+	bad := `<script src="/plugins/??@deepseek-ai/dsh-client-ui-settings-general/client.js"></script>`
+	if dshUIBundleRe.MatchString(bad) {
+		t.Error("没有 rev 的脚本地址不该被匹配（直连必然 404）")
+	}
+}
+
+// 需求①：市场数据过期时快照必须立刻回旧值 + fetching，绝不阻塞页面；
+// 后台单飞重拉由 goroutine 负责，快照本身同步返回。
+func TestMarketReadSnapshotDoesNotBlock(t *testing.T) {
+	marketRead.mu.Lock()
+	marketRead.info = marketReadInfo{ok: true, at: time.Now().Add(-time.Hour), ver: "旧值"}
+	marketRead.fetching = false
+	marketRead.mu.Unlock()
+	t.Cleanup(func() {
+		marketRead.mu.Lock()
+		marketRead.info = marketReadInfo{}
+		marketRead.fetching = false
+		marketRead.mu.Unlock()
+	})
+	start := time.Now()
+	info := marketReadSnapshot()
+	elapsed := time.Since(start)
+	if elapsed > 2*time.Second {
+		t.Fatalf("快照被市场拉取阻塞了 %v（必须立刻返回旧值）", elapsed)
+	}
+	if !info.fetching {
+		t.Error("数据过期时快照必须带 fetching=true，页面据此显示「获取中」")
+	}
+	if info.ver != "旧值" {
+		t.Errorf("过期时应先回旧值，实际 %q", info.ver)
+	}
+	// 等后台单飞结束，别把 goroutine 带进后续测试。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		marketRead.mu.Lock()
+		running := marketRead.fetching
+		marketRead.mu.Unlock()
+		if !running {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Error("后台重拉迟迟不结束（单飞标志没清）")
+}
+
+// 需求①③④：后台页模板要长出这几样 —— 手动检测按钮、获取中徽章、
+// 默认折叠的插件管理、DSH 版本行。
+func TestAdminTemplateNewFeatures(t *testing.T) {
+	var b bytes.Buffer
+	err := adminTpl.Execute(&b, adminView{
+		Title: "t", Version: "1.9.0",
+		MarketFetching: true, UpdatesOK: false,
+		DSHVerFetching: true,
+	})
+	if err != nil {
+		t.Fatalf("模板渲染失败：%v", err)
+	}
+	page := b.String()
+	for _, want := range []string{
+		`value="refresh"`,       // 手动检测刷新按钮
+		"获取中",                  // 获取中徽章（替代「未知」）
+		`id="plugsec"`,          // 插件管理卡（默认折叠的 details）
+		"DSH 版本",               // DSH 版本统计行
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("后台页缺少 %q", want)
+		}
+	}
+	if strings.Contains(page, `id="plugsec" open`) {
+		t.Error("插件管理必须默认折叠（details 不带 open）")
+	}
+	// 没在拉取时不该显示「获取中」，避免把已完成的状态说成进行时。
+	marketRead.mu.Lock()
+	marketRead.info = marketReadInfo{ok: true, at: time.Now(), ver: "1.66.8", sumOK: true}
+	marketRead.fetching = false
+	marketRead.mu.Unlock()
+	dshVerRead.mu.Lock()
+	dshVerRead.ver, dshVerRead.at, dshVerRead.fetching = "0.2.0-rc.2", time.Now(), false
+	dshVerRead.mu.Unlock()
+	t.Cleanup(func() {
+		marketRead.mu.Lock()
+		marketRead.info = marketReadInfo{}
+		marketRead.mu.Unlock()
+		dshVerRead.mu.Lock()
+		dshVerRead.ver, dshVerRead.at = "", time.Time{}
+		dshVerRead.mu.Unlock()
+	})
+	b.Reset()
+	if err := adminTpl.Execute(&b, adminView{
+		Title: "t", Version: "1.9.0",
+		MarketVer: "1.66.8", UpdatesOK: true, DSHVer: "0.2.0-rc.2",
+		Plugins: []pluginRow{{Name: "demo", Spec: "demo@1.0.0"}},
+	}); err != nil {
+		t.Fatalf("模板渲染失败：%v", err)
+	}
+	page = b.String()
+	if strings.Contains(page, "获取中") {
+		t.Error("数据已取到就不该再显示「获取中」")
+	}
+	if !strings.Contains(page, "已最新") {
+		t.Error("UpdatesOK 时应显示「已最新」")
+	}
+	if !strings.Contains(page, "0.2.0-rc.2") {
+		t.Error("DSH 版本应显示在后台页")
 	}
 }

@@ -173,12 +173,22 @@ button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
   </a>
   {{if or .NeedPassword .NeedTOTP}}<div class="or">或</div>{{end}}{{end}}
 
+  {{if .NeedUsername}}
+  <div class="row">
+    <div class="lblrow"><label for="username">用户名</label></div>
+    <div class="field">
+      <input id="username" name="username" type="text" autocomplete="username" placeholder="请输入用户名" required
+             {{if .Locked}}disabled{{else}}{{if not .NeedPassword}}autofocus{{end}}{{end}}>
+    </div>
+  </div>
+  {{end}}
+
   {{if .NeedPassword}}
   <div class="row">
     <div class="lblrow"><label for="pw">访问口令</label></div>
     <div class="field">
       <input id="pw" name="password" type="password" placeholder="请输入口令" required
-             {{if .Locked}}disabled{{else}}{{if not .NeedTOTP}}autofocus{{end}}{{end}}>
+             {{if .Locked}}disabled{{else}}{{if and (not .NeedTOTP) (not .NeedUsername)}}autofocus{{end}}{{end}}>
       <button class="eye" type="button" id="eye" aria-label="切换口令可见性">显示</button>
     </div>
   </div>
@@ -195,6 +205,7 @@ button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
   </div>
   {{end}}
 
+  {{if not .AutoPair}}
   <div class="row">
     <div class="lblrow">
       <label for="dstoken">DSH 令牌</label>
@@ -205,6 +216,7 @@ button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
              placeholder="粘贴 token 字符串" {{if .Locked}}disabled{{end}}>
     </div>
   </div>
+  {{end}}
 
   {{if .TokenNeeded}}
   <div class="hintline">令牌怎么来：在服务器执行下面这条命令，再点「复制」</div>
