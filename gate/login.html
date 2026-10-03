@@ -166,46 +166,46 @@ button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
     </div>
   </div>
 
-  {{if .HasGitHub}}
+  {{if and .HasGitHub (not .Step2)}}
   <a class="gh" href="/__gate/oauth/github/start?next={{.Next}}">
     <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
     用 GitHub 账号登录
   </a>
   {{if or .NeedPassword .NeedTOTP}}<div class="or">或</div>{{end}}{{end}}
 
-  {{if .NeedUsername}}
+  {{if and .NeedUsername (not .Step2)}}
   <div class="row">
     <div class="lblrow"><label for="username">用户名</label></div>
     <div class="field">
       <input id="username" name="username" type="text" autocomplete="username" placeholder="请输入用户名" required
-             {{if .Locked}}disabled{{else}}{{if not .NeedPassword}}autofocus{{end}}{{end}}>
+             {{if .Locked}}disabled{{else}}{{if or (not .NeedPassword) .TwoStep}}autofocus{{end}}{{end}}>
     </div>
   </div>
   {{end}}
 
-  {{if .NeedPassword}}
+  {{if and .NeedPassword (not .Step2)}}
   <div class="row">
     <div class="lblrow"><label for="pw">访问口令</label></div>
     <div class="field">
       <input id="pw" name="password" type="password" placeholder="请输入口令" required
-             {{if .Locked}}disabled{{else}}{{if and (not .NeedTOTP) (not .NeedUsername)}}autofocus{{end}}{{end}}>
+             {{if .Locked}}disabled{{else}}{{if or (and (not .NeedTOTP) (not .NeedUsername)) (and .TwoStep (not .NeedUsername))}}autofocus{{end}}{{end}}>
       <button class="eye" type="button" id="eye" aria-label="切换口令可见性">显示</button>
     </div>
   </div>
   {{end}}
 
-  {{if .NeedTOTP}}
+  {{if and .NeedTOTP (or (not .TwoStep) .Step2)}}
   <div class="row">
     <div class="lblrow"><label for="otp">动态验证码</label><span class="opt">6 位数字，30 秒一换</span></div>
     <div class="field">
       <input id="otp" name="code" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6"
              autocomplete="one-time-code" placeholder="——————" required
-             {{if .Locked}}disabled{{else}}{{if not .NeedPassword}}autofocus{{end}}{{end}}>
+             {{if .Locked}}disabled{{else}}{{if or .Step2 (not .NeedPassword)}}autofocus{{end}}{{end}}>
     </div>
   </div>
   {{end}}
 
-  {{if not .AutoPair}}
+  {{if and (not .AutoPair) (or (not .TwoStep) .Step2)}}
   <div class="row">
     <div class="lblrow">
       <label for="dstoken">DSH 令牌</label>
@@ -218,7 +218,7 @@ button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
   </div>
   {{end}}
 
-  {{if .TokenNeeded}}
+  {{if and .TokenNeeded (or (not .TwoStep) .Step2)}}
   <div class="hintline">令牌怎么来：在服务器执行下面这条命令，再点「复制」</div>
   <div class="cmd">
     <code id="dstok-cmd" data-copy="docker logs dshai-web 2>&1 | grep -o 'token=[^ ]*' | tail -1">docker logs dshai-web 2&gt;&amp;1 | grep -o 'token=[^ ]*' | tail -1</code>
@@ -227,7 +227,9 @@ button.go:disabled{cursor:not-allowed;filter:grayscale(.45) brightness(.85)}
   <div class="hintline">DSH 每次重启令牌都会变；若本设备已有会话，上面这栏可留空。</div>
   {{end}}
 
-  {{if or .NeedPassword .NeedTOTP .TokenNeeded}}<button class="go" type="submit" {{if .Locked}}disabled{{end}}>{{if .Locked}}已锁定{{else if or .NeedPassword .NeedTOTP}}进入{{else}}配对 DSH 令牌{{end}}</button>{{end}}
+  {{if .Step2}}<input type="hidden" name="st" value="{{.StepTok}}">{{end}}
+
+  {{if or .NeedPassword .NeedTOTP .TokenNeeded}}<button class="go" type="submit" {{if .Locked}}disabled{{end}}>{{if .Locked}}已锁定{{else if .Step2}}进入{{else if .TwoStep}}下一步{{else if or .NeedPassword .NeedTOTP}}进入{{else}}配对 DSH 令牌{{end}}</button>{{end}}
 
   {{if .Locked}}<div class="alert lock on" role="alert"><span class="ic">⚠</span><span>尝试次数过多，请等待 {{.Remain}} 后再试</span></div>
   {{else if .Error}}<div class="alert err on" role="alert"><span class="ic">⚠</span><span>{{.Error}}</span></div>{{end}}

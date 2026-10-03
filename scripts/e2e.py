@@ -329,7 +329,7 @@ def main():
     try:
         wait_listen()
 
-        print("== dshai-gate e2e 测试台（1.8.0 回归 + 1.9.0 新需求）==")
+        print("== dshai-gate e2e 测试台（1.9.0 回归 + 1.10.0 新需求）==")
         # ---- 未登录 ----
         st, _, _ = call("GET", "/")
         check("未登录导航 → 401", st == 401, f"实际 {st}")
@@ -515,7 +515,7 @@ def main():
         # 需求② 用户名+口令+动态验证码登录、登录页撤令牌框、自动获取 DSH 会话；
         # 需求① 插件状态「获取中」与手动检测刷新；需求③ 插件管理默认折叠；
         # 需求④ DSH 版本检测 0.2.0-rc.2 + 「缓存 10 分钟」提示。
-        print("== 1.9.0 e2e 测试台（第二实例） ==", flush=True)
+        print("== 1.10.0 e2e 测试台（第二实例） ==", flush=True)
         gate.terminate()
         try:
             gate.wait(timeout=5)
@@ -545,40 +545,61 @@ def main():
         CT = {"Content-Type": "application/x-www-form-urlencoded",
               "Accept": "text/html"}
 
-        # ---- 登录页：三要素、令牌框已撤（需求②） ----
+        # ---- 登录页第 1 步：三要素、令牌框已撤（需求②）、验证码挪到第 2 步（需求④） ----
         st, _, body = call("GET", "/__gate/login", headers={"Accept": "text/html"})
         page = body.decode("utf-8", "replace")
         check("登录页出现用户名框", 'name="username"' in page)
-        check("登录页出现验证码框", 'name="code"' in page)
-        # html/template 会把 + 转义成 &#43;，先还原再比对
+        check("第 1 步不出现验证码框（拆两步·需求④）", 'name="code"' not in page)
+        # html/template 会把 + 转义成 &#43;，先还原再比对（单步模式才用三要素副标题）
         small = (page.split("<small>", 1)[1].split("</small>", 1)[0]
                  .replace("&#43;", "+") if "<small>" in page else "")
-        check("副标题点名三要素",
-              small == "需要用户名 + 口令 + 动态验证码", small)
+        check("两步登录第 1 步副标题点明步骤（需求⑤）",
+              small == "第 1 步 · 输入用户名与口令", small)
         check("登录页撤掉 DSH 令牌框", 'name="dstoken"' not in page)
         check("登录页撤掉取令牌命令", "data-copy=" not in page)
 
+        def step2_with(code, user="e2e-user"):
+            """需求④两步登录：先过第 1 步（用户名+口令）拿步骤票据，再提交验证码。
+            返回 (第1步状态, 第2步状态, 第2步响应头, 第2步页面)。"""
+            f1 = urlencode({"username": user, "password": PASSWORD})
+            s1, _, b1 = call("POST", "/__gate/login", body=f1, headers=CT)
+            p1 = b1.decode("utf-8", "replace")
+            if s1 != 200 or 'name="st"' not in p1:
+                return s1, s1, {}, p1
+            tok = p1.split('name="st" value="', 1)[1].split('"', 1)[0]
+            f2 = urlencode({"username": user, "password": PASSWORD,
+                            "code": code, "st": tok})
+            s2, h2, b2 = call("POST", "/__gate/login", body=f2, headers=CT)
+            return s1, s2, h2, b2.decode("utf-8", "replace")
+
         # ---- 用户名错 ----
-        form = urlencode({"username": "nobody", "password": PASSWORD,
-                          "code": totp_now(TOTP_SECRET)})
+        form = urlencode({"username": "nobody", "password": PASSWORD})
         st, _, body = call("POST", "/__gate/login", body=form, headers=CT)
         page = body.decode("utf-8", "replace")
         check("用户名错 → 401 合并提示",
               st == 401 and "用户名或口令不正确" in page, f"status={st}")
 
-        # ---- 验证码错（挑一个当前 ±1 时间片都不认的码） ----
+        # ---- 第 2 步验证码错（挑一个当前 ±1 时间片都不认的码） ----
         win = {totp_now(TOTP_SECRET, o) for o in (-1, 0, 1)}
         wrong = next(c for c in ("000000", "111111", "123456") if c not in win)
-        form = urlencode({"username": "e2e-user", "password": PASSWORD, "code": wrong})
-        st, _, body = call("POST", "/__gate/login", body=form, headers=CT)
-        page = body.decode("utf-8", "replace")
-        check("验证码错 → 401 合并提示",
-              st == 401 and "口令或动态验证码不正确" in page, f"status={st}")
+        s1, st, _, page = step2_with(wrong)
+        check("两步登录：第 1 步过后出验证码框", 'name="code"' in page and 'name="st"' in page,
+              page[:200])
+        check("第 2 步验证码错 → 401 提示",
+              st == 401 and "动态验证码不正确" in page, f"status={st}")
+        check("第 2 步失败重出验证码栏（不用重敲口令）", 'name="username"' not in page)
 
-        # ---- 正确三要素登录：自动获取 DSH 会话（需求②） ----
-        form = urlencode({"username": "e2e-user", "password": PASSWORD,
-                          "code": totp_now(TOTP_SECRET)})
-        st, hdr, _ = call("POST", "/__gate/login", body=form, headers=CT)
+        # ---- 票据过期/伪造 → 退回第 1 步 ----
+        f = urlencode({"username": "e2e-user", "password": PASSWORD,
+                       "code": totp_now(TOTP_SECRET), "st": "st2.9999999999.forged"})
+        st, _, body = call("POST", "/__gate/login", body=f, headers=CT)
+        page = body.decode("utf-8", "replace")
+        check("伪造步骤票据 → 退回第 1 步",
+              st == 401 and "登录已过期" in page and 'name="username"' in page,
+              f"status={st}")
+
+        # ---- 正确三要素登录（两步）：自动获取 DSH 会话（需求②） ----
+        s1, st, hdr, _ = step2_with(totp_now(TOTP_SECRET))
         n2 = extract_cookie(hdr, "dshai_gate")
         sc = hdr.get("Set-Cookie", "") or ""
         dsa = next((ln.strip().split(";")[0] for ln in sc.split("\n")
@@ -616,6 +637,17 @@ def main():
               page is not None and "缓存 10 分钟" in page, "")
         check("手动检测刷新按钮（需求①）",
               page is not None and "手动检测刷新" in page, "")
+
+        # ---- 局部刷新（1.10.0 需求③）：数据区 id 齐 + fetch 替换整页重载 ----
+        p4 = admin2()
+        anchors = ['id="uptime"', 'id="restartbtn"', 'id="topline"', 'id="banner"',
+                   'id="statgrid"', 'id="plugdata"', 'id="logsummary"', 'id="logrows"',
+                   'id="histsummary"', 'id="histrows"']
+        missing = [a for a in anchors if a not in p4]
+        check("局部刷新数据区锚点齐全（需求③）", not missing, f"缺 {missing}")
+        check("自动刷新改 fetch 不再整页重载（需求③）",
+              "fetch('/__gate/admin'" in p4 and "WATCH=" in p4
+              and "setInterval" not in p4, "")
 
         # ---- 手动检测刷新 ----
         st, _, _ = call("POST", "/__gate/market", cookie=n2 or "",

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -748,5 +749,231 @@ func TestAdminTemplateNewFeatures(t *testing.T) {
 	}
 	if !strings.Contains(page, "0.2.0-rc.2") {
 		t.Error("DSH 版本应显示在后台页")
+	}
+}
+
+// ==================== 1.10.0 新需求 ====================
+
+// 需求②：后台改口令 —— 原口令不对必须拒、确认不一致必须拒；
+// 改对了 currentPWHash() 立刻指向新口令（不用重启），状态文件落 pwHash。
+func TestAdminChangePassword(t *testing.T) {
+	oldPW, oldNeedPw, oldCfg, oldPath, oldW := pwHash, needPw, cfg, cfgPath, cfgWritable
+	t.Cleanup(func() {
+		pwHash, needPw, cfg, cfgPath, cfgWritable = oldPW, oldNeedPw, oldCfg, oldPath, oldW
+		adminMsgState.mu.Lock()
+		adminMsgState.text, adminMsgState.at = "", time.Time{}
+		adminMsgState.mu.Unlock()
+	})
+	pwHash = hashPassword("old-pass-86")
+	needPw = true
+	cfg = gateConfig{}
+	cfgPath = filepath.Join(t.TempDir(), "state.json")
+	cfgWritable = true
+
+	post := func(form url.Values) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodPost, "/__gate/password", strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		handlePassword(w, r)
+		return w
+	}
+	stillOld := func() bool {
+		return subtle.ConstantTimeCompare([]byte(currentPWHash()), []byte(pwHash)) == 1
+	}
+
+	// 原口令错 → 拒，且不落盘
+	w := post(url.Values{"old": {"wrong"}, "new": {"fresh-pass-01"}, "confirm": {"fresh-pass-01"}})
+	if w.Code != http.StatusSeeOther || !stillOld() {
+		t.Fatalf("原口令错必须拒：code=%d 还是旧口令=%v", w.Code, stillOld())
+	}
+	// 确认不一致 → 拒
+	w = post(url.Values{"old": {"old-pass-86"}, "new": {"fresh-pass-01"}, "confirm": {"fresh-pass-02"}})
+	if !stillOld() {
+		t.Fatal("两次输入不一致必须拒")
+	}
+	// 新旧一样 → 拒（防手滑存个没意义的改动）
+	w = post(url.Values{"old": {"old-pass-86"}, "new": {"old-pass-86"}, "confirm": {"old-pass-86"}})
+	if !stillOld() {
+		t.Fatal("新口令与原口令相同应拒")
+	}
+	// 正确 → 生效 + 落盘
+	w = post(url.Values{"old": {"old-pass-86"}, "new": {"fresh-pass-01"}, "confirm": {"fresh-pass-01"}})
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("正确改密应 303 回后台，实际 %d", w.Code)
+	}
+	if subtle.ConstantTimeCompare([]byte(currentPWHash()), []byte(hashPassword("fresh-pass-01"))) != 1 {
+		t.Fatal("改完 currentPWHash() 应指向新口令")
+	}
+	b, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("状态文件没写出来：%v", err)
+	}
+	var onDisk gateConfig
+	if err := json.Unmarshal(b, &onDisk); err != nil {
+		t.Fatalf("状态文件解析失败：%v", err)
+	}
+	if onDisk.PWHash != hashPassword("fresh-pass-01") {
+		t.Errorf("状态文件 pwHash 不对：%q", onDisk.PWHash)
+	}
+	if adminMsg() == "" {
+		t.Error("改完应给后台页一句反馈")
+	}
+}
+
+// 需求②：后台页在口令登录开着时给出改口令表单，没配口令就不给。
+func TestAdminTemplatePasswordForm(t *testing.T) {
+	var b bytes.Buffer
+	if err := adminTpl.Execute(&b, adminView{Title: "t", Version: "1.10.0", PwOn: true}); err != nil {
+		t.Fatalf("模板渲染失败：%v", err)
+	}
+	page := b.String()
+	for _, want := range []string{`action="/__gate/password"`, `name="old"`, `name="new"`, `name="confirm"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("配了口令登录，后台页应有改口令表单（缺 %q）", want)
+		}
+	}
+	b.Reset()
+	if err := adminTpl.Execute(&b, adminView{Title: "t", Version: "1.10.0", PwOn: false}); err != nil {
+		t.Fatalf("模板渲染失败：%v", err)
+	}
+	if strings.Contains(b.String(), `action="/__gate/password"`) {
+		t.Error("没配口令登录不该出现改口令表单")
+	}
+}
+
+// 需求③：自动刷新只刷数据不刷页面 —— JS 里所有被点名的数据区 id 必须真实
+// 存在于渲染出的页面，否则 pick() 全 miss、每 10 秒退化成整页 reload。
+func TestAdminPartialRefreshAnchors(t *testing.T) {
+	var b bytes.Buffer
+	if err := adminTpl.Execute(&b, adminView{
+		Title: "t", Version: "1.10.0", PwOn: true,
+		MarketFetching: true, DSHVerFetching: true,
+		Events: []adminEvent{{Time: "01:02:03", Kind: "测试", Tone: "ok", Text: "x", Count: 1}},
+	}); err != nil {
+		t.Fatalf("模板渲染失败：%v", err)
+	}
+	page := b.String()
+	for _, id := range []string{
+		`id="uptime"`, `id="topline"`, `id="banner"`, `id="statgrid"`,
+		`id="plugdata"`, `id="logsummary"`, `id="logrows"`, `id="histsummary"`, `id="histrows"`,
+	} {
+		if !strings.Contains(page, id) {
+			t.Errorf("局部刷新数据区缺 %s", id)
+		}
+	}
+	if !strings.Contains(page, `data-busy="1"`) {
+		t.Error("获取中时 statgrid 的 data-busy 应为 1（驱动 3 秒节拍）")
+	}
+	if !strings.Contains(page, `fetch('/__gate/admin'`) {
+		t.Error("自动刷新应改用 fetch 拉数据")
+	}
+	if !strings.Contains(page, `WATCH=[`) {
+		t.Error("缺 WATCH 数据区清单")
+	}
+	// 只允许把整页 reload 当作兜底（结构变了），不能是周期性主路径。
+	if strings.Contains(page, "location.reload();\n  }, busy") {
+		t.Error("周期整页重载应已被 fetch+局部替换取代")
+	}
+}
+
+// ---------- 需求④：口令 + 动态验证码拆两步登录 ----------
+
+// 第一步页面：有用户名/口令、没有验证码栏、没有步骤票据字段。
+func TestTwoStepFirstPage(t *testing.T) {
+	v := newLoginView("", false, 0, "/", false)
+	v.TwoStep = true
+	v.NeedUsername, v.NeedPassword, v.NeedTOTP = true, true, true
+	page := string(loginBytes(v))
+	if !strings.Contains(page, `name="username"`) || !strings.Contains(page, `name="password"`) {
+		t.Error("第 1 步必须有用户名与口令框")
+	}
+	if strings.Contains(page, `name="code"`) {
+		t.Error("第 1 步不该出验证码栏（拆两步的意义）")
+	}
+	if strings.Contains(page, `name="st"`) {
+		t.Error("第 1 步还没发票据，不该有 st 字段")
+	}
+	if !strings.Contains(page, "下一步") {
+		t.Error("第 1 步提交按钮应显示「下一步」")
+	}
+}
+
+// 第二步页面：只有验证码 + st 票据 + 令牌栏（按需），不再重问口令。
+func TestTwoStepSecondPage(t *testing.T) {
+	v := step2View("", false, 0, "/", "st2.99.sig", false)
+	v.NeedUsername, v.NeedPassword, v.NeedTOTP = true, true, true
+	page := string(loginBytes(v))
+	if !strings.Contains(page, `name="code"`) {
+		t.Error("第 2 步必须有验证码框")
+	}
+	if !strings.Contains(page, `name="st" value="st2.99.sig"`) {
+		t.Error("第 2 步必须原样带回步骤票据")
+	}
+	if strings.Contains(page, `name="password"`) || strings.Contains(page, `name="username"`) {
+		t.Error("第 2 步不该再问用户名/口令")
+	}
+	if !strings.Contains(page, "第 2 步 · 输入动态验证码") {
+		t.Error("第 2 步副标题应点明当前步骤")
+	}
+}
+
+// 步骤票据：签名格式对、5 分钟内有效、过期与伪造都拒。
+func TestStep2Ticket(t *testing.T) {
+	tok := step2Ticket()
+	exp, ok := signedExp(tok, "st2")
+	if !ok {
+		t.Fatalf("自己签的票据验不过：%q", tok)
+	}
+	if exp <= time.Now().Unix() || exp > time.Now().Add(6*time.Minute).Unix() {
+		t.Errorf("票据过期时间应在 5 分钟上下，实际 exp-now=%ds", exp-time.Now().Unix())
+	}
+	if _, ok := signedExp(tok, "v1"); ok {
+		t.Error("st2 票据不能被当成门禁会话（ver 隔离失效）")
+	}
+	if _, ok := signedExp(tok+".x", "st2"); ok {
+		t.Error("多一段的票据应被拒")
+	}
+	forged := "st2." + strconv.FormatInt(exp, 10) + ".forged"
+	if _, ok := signedExp(forged, "st2"); ok {
+		t.Error("伪造签名的票据应验不过")
+	}
+}
+
+// 非两步模式（只口令、或口令+验证码同页）：页面必须保持老样子——验证码还在第 1 页。
+func TestSingleStepStillShowsCode(t *testing.T) {
+	v := newLoginView("", false, 0, "/", false)
+	v.NeedPassword, v.NeedTOTP = true, true // TwoStep 未置位（mode 未拆）
+	page := string(loginBytes(v))
+	if !strings.Contains(page, `name="code"`) {
+		t.Error("未启用两步模式时验证码必须留在同一页")
+	}
+	if strings.Contains(page, `name="st"`) {
+		t.Error("未启用两步模式不该出现 st 票据字段")
+	}
+}
+
+// 需求⑤（UI 检查优化）：两步登录的第 1 步副标题要和第 2 步的
+//「第 2 步 · …」呼应，点明这是上半程；单步模式仍用 subtitleOf() 原副标题。
+func TestTwoStepFirstPageSubtitle(t *testing.T) {
+	oldNeedPw, oldNeedTotp, oldCfg := needPw, needTotp, cfg
+	t.Cleanup(func() { needPw, needTotp, cfg = oldNeedPw, oldNeedTotp, oldCfg })
+
+	needPw, needTotp, cfg = true, true, gateConfig{} // TOTPEnabled 未设 → 开
+	v := newLoginView("", false, 0, "/", false)
+	if !v.TwoStep {
+		t.Fatal("口令+动态验证码应进入两步模式")
+	}
+	if v.Subtitle != "第 1 步 · 输入用户名与口令" {
+		t.Errorf("第 1 步副标题应点明步骤，实际 %q", v.Subtitle)
+	}
+	if v2 := step2View("", false, 0, "/", "st2.1.x", false); v2.Subtitle != "第 2 步 · 输入动态验证码" {
+		t.Errorf("第 2 步副标题被改坏了：%q", v2.Subtitle)
+	}
+
+	// 单步模式（关掉动态验证码）保持原副标题（测试里没配 GATE_USERNAME → subtitleOf() 给「需要访问口令」）
+	needTotp = false
+	if v3 := newLoginView("", false, 0, "/", false); v3.TwoStep || v3.Subtitle != subtitleOf() {
+		t.Errorf("单步模式副标题不该变：TwoStep=%v Subtitle=%q", v3.TwoStep, v3.Subtitle)
 	}
 }

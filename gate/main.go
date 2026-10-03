@@ -59,7 +59,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.9.0"
+	gateVersion  = "1.10.0"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 
@@ -279,6 +279,15 @@ func signedExp(v, ver string) (int64, bool) {
 		return 0, false
 	}
 	return exp, true
+}
+
+// step2Ticket 需求④两步登录：第一步（口令）通过后签发的 5 分钟步骤票据，
+// 第二步凭它 + 动态验证码完成登录。ver="st2" 与门禁会话（v1）/DSH 配对（d1）
+// 隔开，三种票据同域互相不能冒用；过期时间由 handleLogin 自己判。
+func step2Ticket() string {
+	exp := time.Now().Add(5 * time.Minute).Unix()
+	p := "st2." + strconv.FormatInt(exp, 10)
+	return p + "." + sign(p)
 }
 
 func isHTTPS(r *http.Request) bool {
@@ -1093,6 +1102,9 @@ type loginView struct {
 	HasSession   bool
 	TokenNeeded  bool
 	AutoPair     bool // 需求②：配了 GATE_DSH_SESSION_KEY → 不再显示令牌输入框
+	TwoStep      bool // 需求④：口令 + 动态验证码拆两步登录
+	Step2        bool // 需求④：当前渲染第二步（只出验证码框）
+	StepTok      string
 }
 
 // subtitleOf / tipOf 都由「此刻实际可用的登录方式」算出来，所以后台一关掉某种
@@ -1138,13 +1150,29 @@ func tipOf() string {
 func newLoginView(errMsg string, locked bool, remain time.Duration, next string, hasSession bool) loginView {
 	pw, totp, gh := loginModes()
 	auto := len(dshAutoKey) == 32 // 需求②：自动获取 DSH 会话已配置 → 令牌框整个撤掉
-	return loginView{
+	v := loginView{
 		Title: siteTitle, Subtitle: subtitleOf(), Tip: tipOf(),
 		Next: sanitizeNext(next), Error: errMsg, Locked: locked,
 		Remain: humanDur(remain), NeedPassword: pw, NeedTOTP: totp, HasGitHub: gh,
 		HasSession: hasSession, TokenNeeded: !hasSession && !auto, AutoPair: auto,
 		NeedUsername: gateUser != "",
+		TwoStep:      pw && totp, // 需求④：口令 + 动态验证码 → 拆两步登录
 	}
+	// 需求⑤（UI 检查优化）：两步登录的第 1 步也点明步骤，和第 2 步的
+	//「第 2 步 · …」对上，用户一眼知道自己在上半程；单步模式保持原副标题。
+	if v.TwoStep {
+		v.Subtitle = "第 1 步 · 输入用户名与口令"
+	}
+	return v
+}
+
+// step2View 需求④两步登录的第二步页面：口令那关已过，只问动态验证码，
+// 票据藏在隐藏栏带回；副标题改成步进提示，让用户知道自己在第二步。
+func step2View(errMsg string, locked bool, remain time.Duration, next, tok string, hasSession bool) loginView {
+	v := newLoginView(errMsg, locked, remain, next, hasSession)
+	v.Step2, v.StepTok = true, tok
+	v.Subtitle = "第 2 步 · 输入动态验证码"
+	return v
 }
 
 // loginBytes 渲染登录页。抽出来是为了让「上游 401 就地换成登录页」复用同一份模板，
@@ -1155,14 +1183,19 @@ func loginBytes(v loginView) []byte {
 	return b.Bytes()
 }
 
-func renderLogin(w http.ResponseWriter, status int, errMsg string, locked bool, remain time.Duration, next string, hasSession bool) {
-	body := loginBytes(newLoginView(errMsg, locked, remain, next, hasSession))
+// writeLogin 统一登录页的响应头（no-store + 防嵌iframe + 不带 Referrer），
+// renderLogin / 两步登录的第二步都走这里，避免响应头出现两套写法。
+func writeLogin(w http.ResponseWriter, status int, v loginView) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	_, _ = w.Write(loginBytes(v))
+}
+
+func renderLogin(w http.ResponseWriter, status int, errMsg string, locked bool, remain time.Duration, next string, hasSession bool) {
+	writeLogin(w, status, newLoginView(errMsg, locked, remain, next, hasSession))
 }
 
 func wantsHTML(r *http.Request) bool {
@@ -1198,6 +1231,24 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	hasSession := dshHasSession(r)
 
+	// 需求④：口令与动态验证码都开时拆成两步登录 —— 第一步只验用户名/口令，
+	// 通过后签一张 5 分钟的步骤票据（st2.<过期>.<签名>，与门禁会话同一把密钥），
+	// 第二步凭票据 + 动态验证码完成登录。验签复用 signedExp，伪造不了；
+	// 票据过期或不合法就退回第一步（口令这关没过，验证码无意义）。
+	twoStep := needPw && totpOn()
+	stepTok := strings.TrimSpace(r.FormValue("st"))
+	step2OK := false
+	if twoStep && stepTok != "" {
+		exp, ok := signedExp(stepTok, "st2")
+		if !ok || time.Now().Unix() > exp {
+			secNote("两步登录票据失效", ip, "步骤票据过期或验签失败，退回第一步重来")
+			stepTok = ""
+			renderLogin(w, http.StatusUnauthorized, "登录已过期，请重新输入用户名和口令", false, 0, next, hasSession)
+			return
+		}
+		step2OK = true
+	}
+
 	fail := func(msg string) {
 		time.Sleep(globalDelay())
 		noteGlobalFail()
@@ -1208,7 +1259,13 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		secNote("验证失败", ip, "第 %d 次：%s", n, msg)
-		renderLogin(w, http.StatusUnauthorized, fmt.Sprintf("%s，还可尝试 %d 次", msg, maxFailures-n), false, 0, next, hasSession)
+		full := fmt.Sprintf("%s，还可尝试 %d 次", msg, maxFailures-n)
+		if twoStep && stepTok != "" {
+			// 第二步失败：把票据带回去重出验证码栏，别让人重敲口令。
+			writeLogin(w, http.StatusUnauthorized, step2View(full, false, 0, next, stepTok, hasSession))
+			return
+		}
+		renderLogin(w, http.StatusUnauthorized, full, false, 0, next, hasSession)
 	}
 
 	// GitHub-only 模式（口令与动态验证码都关掉）下，这个表单里没有任何本地凭据可验，
@@ -1253,7 +1310,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if needPw {
+	if needPw && !step2OK {
 		// 需求②：配了 GATE_USERNAME 就先验用户名；两项合成一句提示，不透露错在哪一项
 		if gateUser != "" {
 			gotUser := hashPassword("u:" + r.FormValue("username"))
@@ -1263,12 +1320,19 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		got := hashPassword(r.FormValue("password"))
-		if subtle.ConstantTimeCompare([]byte(got), []byte(pwHash)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(got), []byte(currentPWHash())) != 1 {
 			if gateUser != "" {
 				fail("用户名或口令不正确")
 			} else {
 				fail("口令不正确")
 			}
+			return
+		}
+		if twoStep {
+			// 第一步通过：签 5 分钟步骤票据，回第二步页面（只问动态验证码）。
+			st := step2Ticket()
+			secNote("两步登录·第一步通过", ip, "用户名/口令正确，等待动态验证码")
+			writeLogin(w, http.StatusOK, step2View("", false, 0, next, st, hasSession))
 			return
 		}
 	}
@@ -1277,7 +1341,9 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		ct, ok := verifyTOTP(r.FormValue("code"), ip)
 		totpCt = ct
 		if !ok {
-			if needPw {
+			if twoStep {
+				fail("动态验证码不正确") // 口令已在第一步验过，这步只有验证码会错
+			} else if needPw {
 				fail("口令或动态验证码不正确") // 双因子模式下不透露是哪一项错
 			} else {
 				fail("动态验证码不正确")
@@ -1306,7 +1372,13 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 					// 自动获取模式下页面没有令牌框，别指向一个不存在的输入栏。
 					msg = "自动获取 DSH 会话失败（GATE_DSH_SESSION_KEY 未配置或上游未就绪）"
 				}
-				renderLogin(w, http.StatusUnauthorized, msg, false, 0, next, false)
+				if twoStep {
+					// 两步登录下这错误发生在第 2 步（两关都过了）：票据留着，
+					// 别把人退回第 1 步重敲口令。
+					writeLogin(w, http.StatusUnauthorized, step2View(msg, false, 0, next, stepTok, false))
+				} else {
+					renderLogin(w, http.StatusUnauthorized, msg, false, 0, next, false)
+				}
 				return
 			}
 		}
@@ -1455,10 +1527,10 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
 <header>
   <div class="brand">
     <span class="dot"></span>
-    <h1>{{.Title}} · 安全日志<small>v{{.Version}} · 已运行 {{.Uptime}}</small></h1>
+    <h1>{{.Title}} · 安全日志<small id="uptime">v{{.Version}} · 已运行 {{.Uptime}}</small></h1>
   </div>
   <nav class="actions">
-    <form method="post" action="/__gate/restart"><button class="btn" type="submit"{{if .RestartBusy}} disabled{{end}} title="重启 DSH：会中断正在进行的对话约 30 秒">重启 DSH</button></form>
+    <form method="post" action="/__gate/restart"><button class="btn" id="restartbtn" type="submit"{{if .RestartBusy}} disabled{{end}} title="重启 DSH：会中断正在进行的对话约 30 秒">重启 DSH</button></form>
     <label class="muted auto"><input type="checkbox" id="gauto"> 自动刷新</label>
     <a class="btn" href="/" target="_blank" rel="noopener">进入 DSH ↗</a>
     <a class="btn ghost" href="/__gate/admin">立即刷新</a>
@@ -1466,17 +1538,17 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
   </nav>
 </header>
 
-<div class="restartline">
+<div class="restartline" id="topline">
   <span class="badge badge-{{if .RestartBusy}}warn{{else}}ok{{end}}">{{if .RestartBusy}}重启进行中{{else}}可重启{{end}}</span>
   <span class="muted">最近一次发起：{{if .RestartAt}}{{.RestartAt}}{{else}}还没有{{end}} · 结果：{{if .RestartResult}}{{.RestartResult}}{{else}}—{{end}}</span>
   <span class="muted">装了插件、改了配置要重启才生效时用这个按钮；会中断正在进行的对话约 30 秒，进度就写在这一行，配合「自动刷新」盯着看。</span>
 </div>
 
-{{if .Msg}}<div class="card banner">{{.Msg}}</div>{{end}}
+<div id="banner">{{if .Msg}}<div class="card banner">{{.Msg}}</div>{{end}}</div>
 
 <div class="card">
   <h2>当前状态</h2>
-  <div class="stats">
+  <div class="stats" id="statgrid" data-busy="{{if or .MarketFetching .DSHVerFetching}}1{{else}}0{{end}}">
     <div class="stat"><b>登录方式</b><span>{{.Mode}}</span></div>
     <div class="stat"><b>本设备会话</b><span>剩余 {{.SessionLeft}}</span></div>
     <div class="stat"><b>监听 → 上游</b><span>{{.Listen}} → {{.Upstream}}</span></div>
@@ -1501,6 +1573,15 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
     <button class="btn ghost" type="submit" name="totp" value="{{if .TOTPOn}}off{{else}}on{{end}}">{{if .TOTPOn}}关闭动态验证码登录{{else}}开启动态验证码登录{{end}}</button>
     <span class="muted">改完立即生效，不用重启。密钥由服务器上的 <code>scripts/set-totp.sh</code> 生成，换密钥才会让现有验证码失效。</span>
   </form>{{else}}<p class="muted">还没配动态验证码。服务器上执行 <code>bash /opt/dshai/scripts/set-totp.sh</code> 生成密钥即可。</p>{{end}}
+  {{if .PwOn}}<form method="post" action="/__gate/password" class="grid2" style="margin-top:14px">
+    <label class="wide" style="font-weight:600;margin:0">修改登录口令（不用登服务器改 .env，改完下次登录生效）</label>
+    <label>原口令<input name="old" type="password" autocomplete="current-password" required></label>
+    <label>新口令<input name="new" type="password" autocomplete="new-password" required></label>
+    <label>再输一遍新口令<input name="confirm" type="password" autocomplete="new-password" required></label>
+    <label>动态验证码<input name="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="{{if .TOTPOn}}开着动态验证码时必填{{else}}动态验证码未开启，不用填{{end}}"{{if not .TOTPOn}} disabled{{end}}></label>
+    <div><button class="btn" type="submit">修改口令</button></div>
+    <p class="muted wide">只改口令、不动会话密钥：已登录的设备不受影响，下次登录开始用新口令。{{if not .StateWritable}}<b>警告：配置目录不可写，这里改的东西重启后会丢。</b>{{end}}</p>
+  </form>{{end}}
 </div>
 
 <div class="card">
@@ -1550,6 +1631,7 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
 <div class="card">
   <details id="plugsec">
   <summary>插件管理（经应用市场执行；安装/更新是长任务，点完回本页看进度）— 点这一行展开/收起</summary>
+  <div id="plugdata">
   <div class="restartline">
     <span class="badge badge-{{.OpTone}}">{{if .OpRunning}}{{.Op}}进行中{{else if .OpAt}}上次：{{.Op}}{{else}}还没操作过{{end}}</span>
     <span class="muted">{{if .OpAt}}{{.OpAt}} · {{.OpResult}}{{end}}</span>
@@ -1599,12 +1681,13 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
   {{else if .MarketFetching}}<p class="empty">正在获取插件列表…（取到后本页会自动刷新显示）</p>
   {{else}}<p class="empty">{{if .PluginsErr}}{{.PluginsErr}}{{else}}没有读到插件列表{{end}}</p>{{end}}
   <p class="muted">装完/更完多数要重启 DSH 才生效（页顶「重启 DSH」）。被市场拒绝时，这一行会直接写出原因；每次操作也会记进安全日志。</p>
+  </div>
   </details>
 </div>
 
 <div class="card">
   <details id="logsec">
-  <summary>最近事件（累计 {{.Total}} 条，合并后 {{.Shown}} 行{{if .Older}}，更早的 {{.Older}} 行没列出{{end}}；{{.Stats}}）— 点这一行展开/收起</summary>
+  <summary id="logsummary">最近事件（累计 {{.Total}} 条，合并后 {{.Shown}} 行{{if .Older}}，更早的 {{.Older}} 行没列出{{end}}；{{.Stats}}）— 点这一行展开/收起</summary>
   <div class="logtool">
     <button class="chip" type="button" data-f="all">全部</button>
     <button class="chip" type="button" data-f="bad">只看异常（失败 / 拦截）</button>
@@ -1614,7 +1697,7 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
     <thead><tr>
       <th scope="col">时间</th><th scope="col">事件</th><th scope="col">来源 IP</th><th scope="col">说明</th><th scope="col" style="text-align:right">次数</th>
     </tr></thead>
-    <tbody>
+    <tbody id="logrows">
     {{range .Events}}<tr data-tone="{{.Tone}}">
       <td class="t">{{.Time}}</td>
       <td><span class="badge badge-{{.Tone}}">{{.Kind}}</span></td>
@@ -1632,7 +1715,7 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
 
 <div class="card">
   <details id="histsec">
-  <summary>历史日志（落盘 {{if .LogPath}}已开 · {{.LogSize}} · {{.LogRotate}}{{else}}未启用{{end}}）— 点这一行展开/收起</summary>
+  <summary id="histsummary">历史日志（落盘 {{if .LogPath}}已开 · {{.LogSize}} · {{.LogRotate}}{{else}}未启用{{end}}）— 点这一行展开/收起</summary>
   <form method="get" action="/__gate/admin" class="logtool">
     <input name="q" value="{{.HistQuery}}" placeholder="关键词：事件 / IP / 说明，回车搜索" style="flex:1 1 260px;min-width:180px" autocomplete="off">
     <button class="btn ghost" type="submit">搜索</button>
@@ -1643,7 +1726,7 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
     <thead><tr>
       <th scope="col">时间</th><th scope="col">事件</th><th scope="col">来源 IP</th><th scope="col">说明</th><th scope="col" style="text-align:right">次数</th>
     </tr></thead>
-    <tbody>
+    <tbody id="histrows">
     {{range .Hist}}<tr data-tone="{{.Tone}}">
       <td class="t">{{.Time}}</td>
       <td><span class="badge badge-{{.Tone}}">{{.Kind}}</span></td>
@@ -1695,18 +1778,58 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
   var box=document.getElementById('gauto'), on=ls(AUTO)!=='0';
   box.checked=on;
   box.addEventListener('change',function(){ on=box.checked; ls(AUTO, on?'1':'0'); });
-  var dirty=false;
-  Array.prototype.forEach.call(document.querySelectorAll('form input'), function(el){
-    if(el!==box){ el.addEventListener('input', function(){ dirty=true; }); }
-  });
+  // 1.10.0：自动刷新不再整页重载，只把后端渲染好的数据区换进来——焦点、
+  // 展开状态、筛选状态、输入到一半的内容都原样保留。
+  var WATCH=['uptime','restartbtn','topline','banner','statgrid','plugdata','logsummary','logrows','histsummary','histrows'];
+  function draftIn(id){
+    var host=document.getElementById(id); if(!host){ return false; }
+    if(host.contains(document.activeElement)){ return true; }
+    var ins=host.querySelectorAll('input:not([type=hidden]),textarea');
+    for(var i=0;i<ins.length;i++){
+      var el=ins[i], t=(el.type||'').toLowerCase();
+      if(t==='checkbox'||t==='radio'){ continue; }
+      if((el.value||'').trim()!==''){ return true; }
+    }
+    return false;
+  }
+  function pick(doc,id){
+    var src=doc.getElementById(id); if(!src){ return false; }   // 后端页面没有这块 = 结构变了
+    if(id==='uptime'){ var a=document.getElementById(id); if(a){ a.innerHTML=src.innerHTML; } return true; }
+    if(id==='restartbtn'){ var b=document.getElementById(id); if(b){ b.disabled=src.disabled; } return true; }
+    if(draftIn(id)){ return true; }   // 这块正在输入，跳过本次、下个周期再试
+    var dst=document.getElementById(id);
+    if(!dst){ return false; }
+    dst.innerHTML=src.innerHTML;
+    if(id==='statgrid'){ dst.setAttribute('data-busy', src.getAttribute('data-busy')||'0'); }
+    if(id==='logrows'){ applyFilter(ls(FILTER)); }   // 行换了，把「只看异常」重套一遍
+    return true;
+  }
   // 市场/DSH 版本还在「获取中」时把自动刷新从 10 秒提到 3 秒：数据一到用户
-  // 很快看到，取完（或取失败的 30 秒缓存期内）立刻回到 10 秒，不空转。
-  var busy={{if or .MarketFetching .DSHVerFetching}}1{{else}}0{{end}};
-  setInterval(function(){
-    if(!on || dirty){ return; }
+  // 很快看到，取完（或取失败的缓存期内）立刻回到 10 秒，不空转。
+  function delay(){
+    var sg=document.getElementById('statgrid');
+    return (sg && sg.getAttribute('data-busy')==='1') ? 3000 : 10000;
+  }
+  function tick(){
+    setTimeout(tick, delay());   // 先排下一次，本周期内出错也不会停摆
+    if(!on){ return; }
     if(document.querySelector('input:focus,textarea:focus')){ return; }
-    location.reload();
-  }, busy?3000:10000);
+    fetch('/__gate/admin', {credentials:'same-origin', headers:{'Accept':'text/html'}})
+      .then(function(res){
+        if(res.status===401){ location.reload(); return null; }   // 会话过期 → 整页跳回登录页
+        if(!res.ok){ throw new Error('HTTP '+res.status); }
+        return res.text();
+      })
+      .then(function(html){
+        if(html===null){ return; }
+        var doc=new DOMParser().parseFromString(html, 'text/html');
+        var failed=false;
+        WATCH.forEach(function(id){ if(pick(doc,id)===false){ failed=true; } });
+        if(failed){ location.reload(); }   // 后端页面结构变了：回退成整页刷新
+      })
+      .catch(function(){ /* 网络抖一下，下个周期再试 */ });
+  }
+  tick();
 })();
 </script>
 </body>
@@ -2784,6 +2907,10 @@ type githubConfig struct {
 type gateConfig struct {
 	TOTPEnabled *bool        `json:"totpEnabled,omitempty"`
 	GitHub      githubConfig `json:"github"`
+	// PWHash 是后台改过的口令哈希（64 位 hex，同 GATE_PASSWORD_HASH 格式）。
+	// 非空时启动用它覆盖环境变量里的口令（1.10.0 需求：后台可改密码）。
+	// 只写口令、不动会话密钥 —— 改密码不踢人，已登录的会话继续有效。
+	PWHash string `json:"pwHash,omitempty"`
 	// SessionEpoch 是「登录代数」：每踢一次光（/__gate/logout-all）+1，
 	// 全体旧 Cookie（含未过期的）因代数对不上当场作废。0 = 还没踢过。
 	SessionEpoch int64 `json:"sessionEpoch,omitempty"`
@@ -2849,6 +2976,15 @@ func configSnapshot() gateConfig {
 	cfgMu.Lock()
 	defer cfgMu.Unlock()
 	return cfg
+}
+
+// currentPWHash 当前生效的口令哈希：后台改过的（状态文件）优先，其次环境变量。
+// 每次登录都现取，改密码不用重启、也不用改全局变量。
+func currentPWHash() string {
+	if h := strings.ToLower(strings.TrimSpace(configSnapshot().PWHash)); len(h) == 64 {
+		return h
+	}
+	return pwHash
 }
 
 // modesOf 算出「按这份配置」实际可用的登录方式。
@@ -3244,6 +3380,66 @@ func handleMethods(w http.ResponseWriter, r *http.Request) {
 	backToAdmin(w, r)
 }
 
+// handlePassword 后台改登录口令（1.10.0 需求②）。
+// 老口令必须验过才收新口令（后台会话可能只是走开放代理来的，不能白给改密权）；
+// 开着动态验证码时还要过一次验证码 —— 改密码按「再认证一次」算。
+// 只写状态文件的 pwHash，不动会话密钥：改完不踢人，正在用的登录态继续有效。
+func handlePassword(w http.ResponseWriter, r *http.Request) {
+	if !adminPost(w, r) {
+		return
+	}
+	ip := clientIP(r)
+	old := r.FormValue("old")
+	fresh := r.FormValue("new")
+	again := r.FormValue("confirm")
+	if !needPw {
+		setAdminMsg("没改：现在没配口令登录，改不了口令。")
+		backToAdmin(w, r)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(hashPassword(old)), []byte(currentPWHash())) != 1 {
+		setAdminMsg("没改：原口令不正确。")
+		secNote("修改口令", ip, "被拒：原口令不正确")
+		backToAdmin(w, r)
+		return
+	}
+	if totpOn() {
+		if _, ok := verifyTOTP(r.FormValue("code"), ip); !ok {
+			setAdminMsg("没改：动态验证码不正确。")
+			secNote("修改口令", ip, "被拒：动态验证码不正确")
+			backToAdmin(w, r)
+			return
+		}
+	}
+	if fresh == "" {
+		setAdminMsg("没改：新口令不能为空。")
+		backToAdmin(w, r)
+		return
+	}
+	if fresh != again {
+		setAdminMsg("没改：两次输入的新口令不一致。")
+		backToAdmin(w, r)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(hashPassword(fresh)), []byte(currentPWHash())) == 1 {
+		setAdminMsg("没改：新口令和原口令一样。")
+		backToAdmin(w, r)
+		return
+	}
+	c := configSnapshot()
+	c.PWHash = hashPassword(fresh)
+	err := saveConfig(c)
+	// 下一次登录起用新口令 —— currentPWHash() 每次都先看状态文件，不用改全局变量
+	//（并发登录读 pwHash，写它会数据竞争）。
+	if err != nil {
+		setAdminMsg("口令已改（仅内存生效，没写进磁盘）：%v", err)
+	} else {
+		setAdminMsg("口令已修改。下次登录用新口令；已登录的设备不受影响。")
+	}
+	secNote("修改口令", ip, "口令已更换（登录方式：%s）", modesSummary())
+	backToAdmin(w, r)
+}
+
 // handleGithubSave 保存 GitHub 登录配置（后台页手填，密钥不回显）。
 func handleGithubSave(w http.ResponseWriter, r *http.Request) {
 	if !adminPost(w, r) {
@@ -3338,6 +3534,10 @@ func withGate(next http.Handler) http.Handler {
 				return
 			case gatePrefix + "/methods":
 				handleMethods(w, r)
+				return
+			case gatePrefix + "/password":
+				// 后台改口令（1.10.0）：验旧口令（+动态验证码）后写状态文件
+				handlePassword(w, r)
 				return
 			case gatePrefix + "/github":
 				handleGithubSave(w, r)
@@ -3773,12 +3973,10 @@ func main() {
 	githubAPIBase = strings.TrimSuffix(env("GATE_GITHUB_API_BASE", "https://api.github.com"), "/")
 
 	// 需求②（1.9.0）：用户名维度 + DSH 会话自动获取。
-	// GATE_USERNAME 必须与 GATE_PASSWORD_HASH 同配 —— 只写用户名没口令没有意义。
+	// GATE_USERNAME 必须与口令同配 —— 只写用户名没口令没有意义；
+	// 「配没配上」的校验放在 loadConfig 之后（口令可能来自状态文件），见下。
 	gateUser = strings.TrimSpace(os.Getenv("GATE_USERNAME"))
 	if gateUser != "" {
-		if !needPw {
-			log.Fatal("门禁配置错误：GATE_USERNAME 需要同时配置 GATE_PASSWORD_HASH（用户名必须配口令）")
-		}
 		gateUserHash = hashPassword("u:" + gateUser)
 	}
 	// GATE_DSH_SESSION_KEY：.credentials.yaml 里 client-connection/browser-session 的
@@ -3795,6 +3993,20 @@ func main() {
 	// 后台可改的配置（落盘）。放在 fail-closed 之前：GitHub 登录就是在后台开的，
 	// 关掉动态密码后能不能启动，取决于这个文件读得读不出来。
 	loadConfig(env("GATE_STATE", "/data/state.json"))
+
+	// 后台改过的口令优先于环境变量（1.10.0）：存了就用状态文件里的，
+	// 格式不对则告警并保留 GATE_PASSWORD_HASH，不因为一个坏哈希把人锁在门外。
+	if h := strings.ToLower(strings.TrimSpace(cfg.PWHash)); h != "" {
+		if len(h) == 64 {
+			pwHash, needPw = h, true
+		} else {
+			log.Printf("⚠️ 配置文件里的口令哈希格式不对（应为 64 位 hex），忽略它、继续用 GATE_PASSWORD_HASH")
+		}
+	}
+	// 用户名必须配得上口令（环境变量或后台改过的都算），放在这里才能两种来源都看到。
+	if gateUser != "" && !needPw {
+		log.Fatal("门禁配置错误：GATE_USERNAME 需要同时配置 GATE_PASSWORD_HASH（用户名必须配口令）")
+	}
 
 	// 历史日志落盘（1.8.0）。GATE_LOG：
 	//   缺省 = 状态文件同目录 log.jsonl（跟着 GATE_STATE 走，即 /data 卷）
