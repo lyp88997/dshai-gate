@@ -37,6 +37,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,7 +58,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.7.3"
+	gateVersion  = "1.8.0"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 
@@ -97,6 +98,31 @@ const (
 	outBurst      = 30
 	outWindowLen  = 10 * time.Second
 	outSuppressMg = "门禁：%d 秒内事件过多，另有 %d 条没往标准输出打（内存里仍保留，见后台页「最近事件」）"
+
+	// ---------- 历史日志落盘（1.8.0） ----------
+	//
+	// 内存环形缓冲只有 secLogMax 条、容器一重启就清空 —— 而安全事件恰好是最该
+	// 留证据的东西（谁在什么时候失败了多少次、踢没踢过设备）。所以事件另写一份
+	// JSON Lines 到门禁自己的数据卷，并配三道闸防写爆：
+	//
+	//	histRotateBytes  单文件超限就轮转（.1 → .2 → .3，最多 histRotKeep 份）
+	//	histBurst        每 histWindowLen 窗口最多几行，超出的窗口结束补汇总行
+	//	histThrottle     合并事件（同 IP 同类 30 秒重复）最多多久补写一行
+	histRotateBytes = 8 << 20 // 默认 8 MB 一份
+	histRotKeep      = 3
+	histBurst        = 100
+	histWindowLen    = 10 * time.Second
+	histThrottle     = 30 * time.Second
+	histSuppressMg   = "历史日志：本窗口事件过多，另有 %d 条被限速合并（重启后仍可查最近一条）"
+
+	// 后台「历史日志」卡片的读取上限：只读文件末尾 histTailBytes 字节、
+	// 最多渲染 histRowsMax 行，防止把 24 MB 的日志整个搬进一次页面渲染。
+	histTailBytes = 256 << 10 // 256 KB
+	histRowsMax   = 200
+
+	// ---------- DSH 健康巡检（1.8.0） ----------
+	// 连续 healthFails 次探不通才算「不可达」，单次拨号超时（网络抖动）不记事件。
+	healthFails = 3
 )
 
 var (
@@ -154,7 +180,18 @@ func sign(payload string) string {
 }
 
 func issueCookie() (string, int) {
-	return issueSigned("v1", sessionDs)
+	exp := time.Now().Add(time.Duration(sessionDs) * 24 * time.Hour).Unix()
+	return signSession("v1", exp, sessionEpoch()), sessionDs * 86400
+}
+
+// signSession 拼「版本.过期.代数」三段并签名（不加代数段那半截签名 = 旧格式）。
+// epoch 传 0 时输出旧三段式，让升级前发出的 Cookie 与新格式天然同域可验。
+func signSession(ver string, exp int64, epoch int64) string {
+	p := ver + "." + strconv.FormatInt(exp, 10)
+	if epoch > 0 {
+		p += "." + strconv.FormatInt(epoch, 10)
+	}
+	return p + "." + sign(p)
 }
 
 // issueSigned 生成「版本号.过期时间.签名」三段式 Cookie 值。
@@ -166,9 +203,53 @@ func issueSigned(ver string, days int) (string, int) {
 	return p + "." + sign(p), days * 86400
 }
 
+// cookieValid 验签门禁会话，并核对「代数」。
+//
+// 1.8.0 起 Cookie 有两种形状，签名都盖在自己的完整前缀上，互相不能冒用：
+//
+//	v1.<exp>.<sig>          旧格式，按代数 0 算（升级前发的，继续认）
+//	v1.<exp>.<epoch>.<sig>  新格式，epoch 必须等于当前代数
+//
+// 「踢光所有设备」把代数 +1：旧 Cookie（含没到期的）当场全部作废，
+// 只有拿到新代 Cookie 的设备还能进门 —— 这正是用户点那个按钮要的效果。
 func cookieValid(v string) bool {
-	exp, ok := signedExp(v, "v1")
+	exp, ok := sessionSignedExp(v)
 	return ok && time.Now().Unix() <= exp
+}
+
+// sessionSignedExp 验签解出门禁会话 Cookie 的过期时间与代数（不判过期，
+// 代数不符直接判假）。调用方据此拒绝旧代 Cookie。
+func sessionSignedExp(v string) (int64, bool) {
+	parts := strings.Split(v, ".")
+	if len(parts) < 3 || len(parts) > 4 || parts[0] != "v1" {
+		return 0, false
+	}
+	exp, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	epoch := int64(0)
+	if len(parts) == 4 { // 新格式：第三段是代数
+		epoch, err = strconv.ParseInt(parts[2], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+	}
+	sig := parts[len(parts)-1]
+	if !hmac.Equal([]byte(sign(strings.Join(parts[:len(parts)-1], "."))), []byte(sig)) {
+		return 0, false
+	}
+	if epoch != sessionEpoch() {
+		return 0, false
+	}
+	return exp, true
+}
+
+// sessionEpoch 读当前会话代数（配置文件里持久化，门禁重启不丢）。
+func sessionEpoch() int64 {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfg.SessionEpoch
 }
 
 // signedExp 验签并解出过期时间（不判断是否过期，交给调用方）。
@@ -492,6 +573,7 @@ func secNote(kind, ip, format string, args ...any) {
 	if !merged {
 		logNote(kind, ip, text)
 	}
+	histAppend(kind, ip, text, merged) // 1.8.0：同步落盘（未启用时是空操作）
 }
 
 func secSnapshot() ([]secEvent, int64) {
@@ -510,6 +592,341 @@ func humanUptime(d time.Duration) string {
 		return fmt.Sprintf("%d 小时 %d 分钟", int(d.Minutes())/60, int(d.Minutes())%60)
 	default:
 		return fmt.Sprintf("%d 分钟", int(d.Minutes()))
+	}
+}
+
+// ---------- 历史日志落盘（1.8.0） ----------
+
+// histRow 是磁盘上一行 JSON Lines 的形状。字段缩写只为省磁盘：一天上万行时
+// "kind"/"ip"/"text" 比全名省 30% 体积。
+type histRow struct {
+	Time  time.Time `json:"t"`
+	Kind  string    `json:"kind"`
+	IP    string    `json:"ip"`
+	Text  string    `json:"text"`
+	Count int       `json:"count"`
+}
+
+var (
+	histMu   sync.Mutex
+	histF    *os.File // nil = 没启用（没配路径 / 目录不可写 / 写坏了）
+	histPath string   // "" = 显式关闭
+	histSize int64
+	histWErr string // 打不开/写失败的原因，显示在后台页
+
+	// 合并事件的节流账本：kind+ip → 上次真正落盘的时间与被攒下的条数。
+	histLast    map[string]time.Time
+	histDelta   map[string]int
+	histWindowN int
+	histWindowAt   time.Time
+	histSuppressed int
+	histWarned     bool
+
+	// histRotateSize 单文件轮转阈值，可用 GATE_LOG_BYTES 覆盖（测试用小值）。
+	histRotateSize int64 = histRotateBytes
+)
+
+// histOpen 打开（或关闭，path 为空时）历史日志文件。与配置目录同款降级策略：
+// 打不开就整段关掉并把原因留在 histWErr，门禁照常工作 —— 日志永远不该挡住门。
+func histOpen(path string) error {
+	histMu.Lock()
+	defer histMu.Unlock()
+	histPath = path
+	histLast = map[string]time.Time{}
+	histDelta = map[string]int{}
+	histWindowAt = time.Time{}
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		histWErr = err.Error()
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		histWErr = err.Error()
+		return err
+	}
+	if st, err := f.Stat(); err == nil {
+		histSize = st.Size()
+	}
+	histF, histWErr = f, ""
+	return nil
+}
+
+// histDecision 是落盘限速的全部策略（与 outDecision 同构，独立窗口——
+// 标准输出限的是 docker logs，这里限的是磁盘文件，两者互不干扰）。
+// 返回：这一行放不放行；窗口刚翻篇时该补写的那条汇总行文案（没有就是空串）。
+// 改窗口状态，调用前须持有 histMu。
+func histDecision(now time.Time) (allow bool, summary string) {
+	if histWindowAt.IsZero() {
+		histWindowAt = now
+	}
+	if now.Sub(histWindowAt) >= histWindowLen {
+		if histSuppressed > 0 {
+			summary = fmt.Sprintf(histSuppressMg, histSuppressed)
+		}
+		histWindowAt, histWindowN, histSuppressed = now, 0, 0
+	}
+	histWindowN++
+	if histWindowN > histBurst {
+		histSuppressed++
+		return false, summary
+	}
+	return true, summary
+}
+
+// histWriteLocked 写一行并按需轮转。调用前须持有 histMu 且 histF != nil。
+func histWriteLocked(e histRow) error {
+	if e.Count <= 0 {
+		e.Count = 1
+	}
+	b, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	if _, err := histF.Write(b); err != nil {
+		histSetErr(err)
+		return err
+	}
+	histSize += int64(len(b))
+	if histSize >= histRotateSize {
+		histRotateLocked()
+	}
+	return nil
+}
+
+// histRotateLocked 把 log.jsonl 挪成 .1（旧的 .1→.2、.2→.3，最多保留
+// histRotKeep 份），再重开一个空文件。rename 是原子的，读侧最坏看到一次空。
+func histRotateLocked() {
+	if histF != nil {
+		_ = histF.Close()
+		histF = nil
+	}
+	base := histPath
+	for i := histRotKeep - 1; i >= 1; i-- {
+		from := fmt.Sprintf("%s.%d", base, i)
+		if _, err := os.Stat(from); err == nil {
+			_ = os.Rename(from, fmt.Sprintf("%s.%d", base, i+1))
+		}
+	}
+	_ = os.Rename(base, base+".1")
+	f, err := os.OpenFile(base, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		histSetErr(err)
+		return
+	}
+	histF, histSize, histWErr = f, 0, ""
+}
+
+// histSetErr 记录写错误并只向标准输出告警一次（磁盘满时不能每行喊一嗓子）。
+func histSetErr(err error) {
+	histWErr = err.Error()
+	if !histWarned {
+		histWarned = true
+		log.Printf("⚠️ 历史日志写失败，后续不再重复告警：%v", err)
+	}
+}
+
+// histAppend 落一条事件（secNote 唯一调用点）。
+//
+// merged=false（新事件）直接写；merged=true（同 IP 同类合并进来的重复）最多
+// histThrottle 补写一行，攒下的次数记进本行 Count —— 既不逐条写爆磁盘，
+// 也不静默丢计数。无论哪种，都先过 histDecision 这道窗口闸。
+func histAppend(kind, ip, text string, merged bool) {
+	histMu.Lock()
+	defer histMu.Unlock()
+	if histF == nil {
+		return
+	}
+	key := kind + "\x00" + ip
+	now := time.Now()
+	histDelta[key]++
+	if merged {
+		if last, ok := histLast[key]; ok && now.Sub(last) < histThrottle {
+			return // 还没到该补写的时候，次数已在账上
+		}
+	}
+	allow, summary := histDecision(now)
+	if summary != "" {
+		_ = histWriteLocked(histRow{Time: now, Kind: "落盘限速", IP: "-", Text: summary, Count: 1})
+	}
+	if !allow {
+		return // 超限：本条留在 histDelta 里，窗口翻篇后随下一次写盘带出去
+	}
+	if err := histWriteLocked(histRow{Time: now, Kind: kind, IP: ip, Text: text, Count: histDelta[key]}); err != nil {
+		return
+	}
+	histLast[key] = now
+	histDelta[key] = 0
+}
+
+// histCombinedTail 把当前文件与轮转出去的 .histRotKeep…\.1 拼起来读尾部
+//（旧在前、新在后，各自最多 histTailBytes）。只读当前文件的话，轮转一发生
+// 页面就只剩新文件那几行——24MB 的历史全躺在旁边看不见，等于白留。
+func histCombinedTail(path string) ([]byte, error) {
+	var buf []byte
+	for i := histRotKeep; i >= 1; i-- {
+		b, err := readFileTail(fmt.Sprintf("%s.%d", path, i), histTailBytes)
+		if err == nil {
+			buf = append(buf, b...)
+			buf = append(buf, '\n') // 文件间补分隔，防边界粘行
+		}
+	}
+	b, err := readFileTail(path, histTailBytes)
+	if err != nil {
+		if len(buf) == 0 {
+			return nil, err
+		}
+		return buf, nil
+	}
+	return append(buf, b...), nil
+}
+
+// histReadRows 读当前与轮转文件的尾部，按 q 过滤（事件/IP/说明
+// 三处包含即中），返回最新在前的最多 histRowsMax 行。任何失败都返回空切片：
+// 这是后台页的一张卡片，不该让整页渲染失败。
+func histReadRows(q string) []adminEvent {
+	histMu.Lock()
+	path := histPath
+	histMu.Unlock()
+	if path == "" {
+		return nil
+	}
+	data, err := histCombinedTail(path)
+	if err != nil {
+		return nil
+	}
+	q = strings.ToLower(strings.TrimSpace(q))
+	var out []histRow
+	for _, ln := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		var e histRow
+		if ln == "" || json.Unmarshal([]byte(ln), &e) != nil {
+			continue
+		}
+		if q != "" && !strings.Contains(strings.ToLower(e.Kind+" "+e.IP+" "+e.Text), q) {
+			continue
+		}
+		out = append(out, e)
+	}
+	if len(out) > histRowsMax {
+		out = out[len(out)-histRowsMax:]
+	}
+	rows := make([]adminEvent, 0, len(out))
+	for i := len(out) - 1; i >= 0; i-- { // 最新在最上面，与「最近事件」一致
+		e := out[i]
+		rows = append(rows, adminEvent{
+			Time: e.Time.Local().Format("2006-01-02 15:04:05"),
+			Kind: e.Kind, Tone: toneOf(e.Kind, e.Text),
+			IP: e.IP, Text: e.Text, Count: e.Count,
+		})
+	}
+	return rows
+}
+
+// readFileTail 读文件末尾至多 max 字节；从中间开始读时丢掉第一条可能不完整的行。
+func readFileTail(path string, max int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	off := int64(0)
+	if st.Size() > max {
+		off = st.Size() - max
+	}
+	buf := make([]byte, st.Size()-off)
+	if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+		return nil, err
+	}
+	if off > 0 {
+		if i := strings.IndexByte(string(buf), '\n'); i >= 0 {
+			buf = buf[i+1:]
+		}
+	}
+	return buf, nil
+}
+
+// histSizeDesc 给后台页的一句话（未启用就说清楚原因）。
+func histSizeDesc() (path, desc string) {
+	histMu.Lock()
+	defer histMu.Unlock()
+	if histPath == "" {
+		return "", "未启用"
+	}
+	if histF == nil {
+		return histPath, "不可写：" + histWErr
+	}
+	switch {
+	case histSize >= 1<<20:
+		return histPath, fmt.Sprintf("%.1f MB", float64(histSize)/(1<<20))
+	default:
+		return histPath, fmt.Sprintf("%d KB", histSize>>10)
+	}
+}
+
+// ---------- DSH 健康巡检（1.8.0） ----------
+
+// healthState 记录「DSH 通不通」的观察史。抽出来只为可测：判断一次探活该不该
+// 发事件（以及发哪种），是这个功能唯一的逻辑。
+type healthState struct {
+	mu     sync.Mutex
+	seenUp bool   // 见过至少一次「通」
+	down   bool   // 正处在「不可达」中
+	downAt time.Time
+	fails  int
+}
+
+// step 处理一次探活结果，返回该记事件的种类与文案（空串 = 不记）。
+//
+//	从未通过 → 首次通：「DSH 就绪」（门禁自己起来时 DSH 早就在跑，不是重启）
+//	通 → 连续 healthFails 次不通：「DSH 不可达」（拨号抖动不记，记一次就停）
+//	不可达 → 通：「DSH 重启」，带真实离线时长（不管是被谁重启的，都能查到）
+func (h *healthState) step(ok bool, now time.Time) (kind, text string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if ok {
+		h.fails = 0
+		if h.down {
+			h.down = false
+			return "DSH 重启", fmt.Sprintf("DSH 恢复在线（离线 %s）", now.Sub(h.downAt).Round(time.Second))
+		}
+		if !h.seenUp {
+			h.seenUp = true
+			return "DSH 就绪", "DSH 已就绪（端口探通）"
+		}
+		return "", ""
+	}
+	h.fails++
+	if h.fails < healthFails {
+		return "", ""
+	}
+	if !h.down {
+		h.down = true
+		h.downAt = now
+		return "DSH 不可达", fmt.Sprintf("DSH 端口探不通（连续 %d 次）", h.fails)
+	}
+	return "", ""
+}
+
+var healthMonitor healthState
+var healthInterval = 5 * time.Second // GATE_HEALTH_INTERVAL 秒；0 = 关闭
+
+// healthLoop 周期拨一次上游端口。放在 goroutine 里，探活永远不该拖慢请求路径。
+func healthLoop() {
+	for {
+		time.Sleep(healthInterval)
+		if upstreamURL == nil {
+			continue
+		}
+		if kind, text := healthMonitor.step(dshListening(), time.Now()); kind != "" {
+			secNote(kind, "-", "%s", text)
+		}
 	}
 }
 
@@ -924,6 +1341,9 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
     <div class="stat"><b>事件计数</b><span>累计 {{.Total}} 条（合并后显示 {{.Shown}} 行）</span></div>
     <div class="stat"><b>全局限流</b><span>当前响应延迟 {{.Delay}}</span></div>
     <div class="stat"><b>锁定中的 IP</b><span>{{if .Locks}}{{range .Locks}}<span class="pill">{{.IP}} · 剩余 {{.Until}} · 失败 {{.Fails}} 次</span>{{end}}{{else}}无{{end}}</span></div>
+    <div class="stat"><b>DSH 状态</b><span>{{if .DshUp}}<span class="badge badge-ok">正常</span>{{else}}<span class="badge badge-err">连不上</span>{{end}} · 内存内上游错误 {{.UpErrCount}} 条 · DSH 重启 {{.RestartCount}} 次</span></div>
+    <div class="stat"><b>应用市场</b><span>{{if .MarketVer}}{{.MarketVer}}{{else}}—{{end}} · 可更新 {{.UpdateCount}} 个 · 快照 {{.SnapshotCount}} 份</span></div>
+    {{if .MarketBusy}}<div class="stat"><b>市场正在跑</b><span>{{.MarketPhase}} · {{.MarketLine}}</span></div>{{end}}
   </div>
 </div>
 
@@ -977,6 +1397,62 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
 </div>
 
 <div class="card">
+  <h2>登录设备</h2>
+  <form method="post" action="/__gate/logout-all" class="restartbar" onsubmit="return confirm('踢光所有设备？所有已登录的浏览器（包括本机）都要重新登录一次，本机会自动续上。')">
+    <button class="btn ghost danger" type="submit">踢光所有设备</button>
+    <span class="muted">怀疑有别的浏览器还登着、或口令/验证码泄露过，按这个按钮：全体旧登录立即作废、其它设备回到登录页，本机自动续上，DSH 配对不受影响。{{if .Epoch}}已踢过 {{.Epoch}} 轮。{{end}}</span>
+  </form>
+</div>
+
+<div class="card">
+  <h2>插件管理（经应用市场执行；安装/更新是长任务，点完回本页看进度）</h2>
+  <div class="restartline">
+    <span class="badge badge-{{.OpTone}}">{{if .OpRunning}}{{.Op}}进行中{{else if .OpAt}}上次：{{.Op}}{{else}}还没操作过{{end}}</span>
+    <span class="muted">{{if .OpAt}}{{.OpAt}} · {{.OpResult}}{{end}}</span>
+    {{if .MarketBusy}}<span class="badge badge-warn">市场忙</span><span class="muted">{{.MarketPhase}} · {{.MarketLine}}</span>{{end}}
+  </div>
+  <form method="post" action="/__gate/market" class="restartbar">
+    <input type="hidden" name="op" value="install">
+    <input name="url" style="flex:1 1 340px;min-width:220px" placeholder="粘贴插件地址 https://…（必须是市场精选列表里的地址）" autocomplete="off" spellcheck="false">
+    <button class="btn" type="submit">安装</button>
+  </form>
+  {{if .Plugins}}
+  <div class="tablewrap"><table>
+    <thead><tr>
+      <th scope="col">插件</th><th scope="col">更新</th><th scope="col">状态</th><th scope="col" style="text-align:right">操作</th>
+    </tr></thead>
+    <tbody>
+    {{range .Plugins}}<tr>
+      <td><b>{{.Name}}</b><div class="muted" style="font-size:11.5px">{{.Spec}}</div></td>
+      <td>{{if .Updatable}}<span class="badge badge-warn">{{.Latest}} 可更新</span>{{else}}{{if $.UpdatesOK}}<span class="badge badge-ok">已最新</span>{{else}}<span class="badge badge-info">未知</span>{{end}}{{end}}</td>
+      <td>{{if .Disabled}}<span class="badge badge-info">已停用</span>{{else}}<span class="badge badge-ok">启用中</span>{{end}}</td>
+      <td style="white-space:nowrap;text-align:right">
+        <form method="post" action="/__gate/market" style="display:inline">
+          <input type="hidden" name="op" value="toggle">
+          <input type="hidden" name="name" value="{{.Name}}">
+          <input type="hidden" name="enabled" value="{{if .Disabled}}1{{else}}0{{end}}">
+          <button class="btn ghost" type="submit">{{if .Disabled}}启用{{else}}停用{{end}}</button>
+        </form>
+        {{if .Updatable}}<form method="post" action="/__gate/market" style="display:inline">
+          <input type="hidden" name="op" value="update">
+          <input type="hidden" name="name" value="{{.Name}}">
+          <button class="btn" type="submit">更新</button>
+        </form>{{end}}
+        <form method="post" action="/__gate/market" style="display:inline" onsubmit="return confirm('确定卸载 {{.Name}}？页面上它提供的功能会消失。')">
+          <input type="hidden" name="op" value="uninstall">
+          <input type="hidden" name="name" value="{{.Name}}">
+          <button class="btn ghost danger" type="submit">卸载</button>
+        </form>
+      </td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table></div>
+  {{else}}<p class="empty">{{if .PluginsErr}}{{.PluginsErr}}{{else}}没有读到插件列表{{end}}</p>{{end}}
+  <p class="muted">装完/更完多数要重启 DSH 才生效（页顶「重启 DSH」）。被市场拒绝时，这一行会直接写出原因；每次操作也会记进安全日志。</p>
+</div>
+
+<div class="card">
   <details id="logsec">
   <summary>最近事件（累计 {{.Total}} 条，合并后 {{.Shown}} 行{{if .Older}}，更早的 {{.Older}} 行没列出{{end}}；{{.Stats}}）— 点这一行展开/收起</summary>
   <div class="logtool">
@@ -1004,7 +1480,36 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
   </details>
 </div>
 
-<div class="foot">只保留内存中最近 {{.Max}} 条，容器重启即清空 · 短地址 <a href="/gate">/gate</a></div>
+<div class="card">
+  <details id="histsec">
+  <summary>历史日志（落盘 {{if .LogPath}}已开 · {{.LogSize}} · {{.LogRotate}}{{else}}未启用{{end}}）— 点这一行展开/收起</summary>
+  <form method="get" action="/__gate/admin" class="logtool">
+    <input name="q" value="{{.HistQuery}}" placeholder="关键词：事件 / IP / 说明，回车搜索" style="flex:1 1 260px;min-width:180px" autocomplete="off">
+    <button class="btn ghost" type="submit">搜索</button>
+    {{if .HistQuery}}<a class="btn ghost" href="/__gate/admin">清除</a>{{end}}
+  </form>
+  {{if .LogPath}}<p class="muted">文件 <code>{{.LogPath}}</code>；搜索从文件末尾往回读最近一段，最多列 {{.HistCap}} 行（最新在上）。</p>{{end}}
+  <div class="tablewrap"><table>
+    <thead><tr>
+      <th scope="col">时间</th><th scope="col">事件</th><th scope="col">来源 IP</th><th scope="col">说明</th><th scope="col" style="text-align:right">次数</th>
+    </tr></thead>
+    <tbody>
+    {{range .Hist}}<tr data-tone="{{.Tone}}">
+      <td class="t">{{.Time}}</td>
+      <td><span class="badge badge-{{.Tone}}">{{.Kind}}</span></td>
+      <td class="ip">{{.IP}}</td>
+      <td>{{.Text}}</td>
+      <td class="n">{{.Count}}</td>
+    </tr>
+    {{else}}<tr><td colspan="5" class="empty">{{if .LogPath}}没有匹配的记录。{{else}}落盘未启用：给门禁设 <code>GATE_LOG</code> 指向可写文件即可长期留痕（默认在状态文件同目录 log.jsonl）。{{end}}</td></tr>
+    {{end}}
+    </tbody>
+  </table></div>
+  <p class="muted">上面「最近事件」只在内存里、重启就没；这张表来自落盘文件，重启后照样能翻。落盘每窗口限速写入，被限速的合并事件只累加计数、窗口结束补一条汇总——信息不丢，只是少写几行。文件写不进去时会在启动日志里告警，页面也能看到。</p>
+  </details>
+</div>
+
+<div class="foot">内存里最近 {{.Max}} 条{{if .LogPath}}；历史日志落盘 <code>{{.LogPath}}</code>，重启不丢{{else}}，容器重启即清空{{end}} · 短地址 <a href="/gate">/gate</a></div>
 </div>
 <script>
 (function(){
@@ -1013,6 +1518,9 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
   var d=document.getElementById('logsec');
   if(ls(LOG)==='1'){ d.open=true; }
   d.addEventListener('toggle',function(){ ls(LOG, d.open?'1':'0'); });
+  var hs=document.getElementById('histsec');
+  if(ls('dshai_admin_hist_open')==='1'){ hs.open=true; }
+  hs.addEventListener('toggle',function(){ ls('dshai_admin_hist_open', hs.open?'1':'0'); });
   var tbl=document.getElementById('logtable'), chips=document.querySelectorAll('.logtool .chip'), hint=document.getElementById('logfilterhint');
   function applyFilter(f){
     if(f!=='bad'){ f='all'; }
@@ -1112,6 +1620,39 @@ type adminView struct {
 	RestartBusy   bool
 	RestartAt     string
 	RestartResult string
+
+	// 体检（1.8.0）：全是「读」，不在这页改任何东西
+	DshUp         bool   // 上游现在通不通（探活一次）
+	UpErrCount    int    // 内存里的「上游错误」事件条数
+	RestartCount  int    // 内存里的「DSH 重启」次数
+	MarketVer     string // 市场插件版本（拉不到写「拉取失败」）
+	UpdateCount   int    // 有可更新的插件数
+	UpdatesOK     bool   // 更新摘要拉到了吗（false 时不许说「已最新」）
+	SnapshotCount int    // 快照数
+	MarketBusy    bool   // 市场正在跑长任务（装/更）
+	MarketPhase   string
+	MarketLine    string
+
+	// 插件管理
+	Plugins    []pluginRow
+	PluginsErr string
+	OpRunning  bool
+	Op         string
+	OpAt       string
+	OpResult   string
+	OpTone     string
+
+	// 历史日志（1.8.0 落盘）
+	LogPath   string // 空 = 未启用
+	LogSize   string // 当前大小或状态
+	LogRotate string // 轮转规则一句话
+	Hist      []adminEvent
+	HistShown int
+	HistQuery string
+	HistCap   int // 页面每次最多给几行
+
+	// 踢光设备
+	Epoch int64
 }
 
 // toneOf 把事件种类（必要时结合说明文字）映射成配色：失败类红、拦截类黄、
@@ -1123,13 +1664,20 @@ type adminView struct {
 // Kind 判，判不出来再看说明里的信号词。
 func toneOf(kind, text string) string {
 	switch kind {
-	case "登录成功", "令牌换票成功", "登出":
+	case "登录成功", "令牌换票成功", "登出", "DSH 就绪":
 		return "ok"
 	case "验证失败", "锁定", "动态码重放", "令牌换票失败", "上游错误", "探测 DSH 失败",
-		"GitHub 换票失败", "GitHub 查询账号失败":
+		"GitHub 换票失败", "GitHub 查询账号失败", "DSH 不可达":
 		return "err"
-	case "未鉴权拦截", "锁定期间尝试", "接口缺有效 DSH 会话":
+	case "未鉴权拦截", "锁定期间尝试", "接口缺有效 DSH 会话",
+		"踢光设备", "DSH 重启", "历史日志":
 		return "warn"
+	case "插件操作":
+		// 同一类里既有「更新完成」也有「被市场拒绝」，先看文案里的信号词。
+		if strings.Contains(text, "失败") || strings.Contains(text, "拒绝") || strings.Contains(text, "错误") {
+			return "err"
+		}
+		return "ok"
 	}
 	if strings.Contains(text, "被拒") || strings.Contains(text, "拒绝") || strings.Contains(text, "失败") {
 		return "err"
@@ -1378,6 +1926,419 @@ func handleRestart(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, gatePrefix+"/admin", http.StatusSeeOther)
 }
 
+// handleLogoutAll 一键踢光所有登录设备（1.8.0）。
+//
+// 原理：门禁会话 Cookie 是无状态签名的，正常情况下服务端「不记得」发过谁 ——
+// 这里给配置加一个会话代数（SessionEpoch），签名时把代数盖进去，校验时代数
+// 不匹配一律按过期处理。代数 +1 后，所有旧 Cookie（含本机的）立即作废，
+// 再给本机补发新一代 Cookie，于是「别的设备全部被踢、本机保持登录」。
+// 代数落盘在 GATE_STATE 里，重启不回滚。踢不掉的只有服务器明确记名的
+// d1 DSH 配对戳（stampDSHSession），那个由 DSH 自己管。
+func handleLogoutAll(w http.ResponseWriter, r *http.Request) {
+	if !adminPost(w, r) {
+		return
+	}
+	ip := clientIP(r)
+	c := configSnapshot()
+	c.SessionEpoch++
+	msg := fmt.Sprintf("已踢光：所有设备需要重新登录（会话代数 → %d），本机已自动续上新代。", c.SessionEpoch)
+	if err := saveConfig(c); err != nil {
+		// saveConfig 失败时内存里的代数已经生效，但重启会回滚 —— 必须如实告知，
+		// 不能让用户以为重启后还踢得干净。
+		msg = fmt.Sprintf("已踢光（仅本次运行生效：状态文件写失败 %v，重启门禁后代数会回退，届时需再踢一次）。", err)
+	}
+	secNote("踢光设备", ip, "会话代数 → %d，旧 Cookie 全部作废", c.SessionEpoch)
+	val, maxAge := issueCookie()
+	setCookie(w, r, cookieName, val, maxAge) // 本机换发新一代
+	setAdminMsg("%s", msg)
+	backToAdmin(w, r)
+}
+
+// ---------- 后台页的插件管理（1.8.0） ----------
+//
+// 边界说明：门禁不碰容器、不碰宿主文件（镜像里连 docker 都没有，数据卷只挂了
+// /data）。插件的安装/启停/更新/卸载全部经 HTTP 转给 dshmarket 自己的路由，
+// 门禁只做三件事：同源与登录校验、参数合法性把关、把结果写回页面。
+//
+// 与市场路由的关系：那 20 条写路由（marketMutationPaths）**自身不校验 DSH 会话**
+// （2026-10-03 读源码确认，整个 routes.js 没有任何会话检查，唯一门是 sameOrigin），
+// 所以 withGate 把它们一并纳入第二层（需有效 DSH 会话）。本函数是服务端发起的
+// 调用，不经过 withGate 那个分支，不受影响；浏览器直连市场路由则会被第二层拦下。
+
+// pluginRow 是插件表的一行。
+type pluginRow struct {
+	Name      string
+	Spec      string // package.json 里的依赖写法（^1.2.3 / link:… / registry:…）
+	Latest    string // 拉到更新信息时才有值
+	Updatable bool
+	Disabled  bool
+}
+
+// marketOpState 与 restartState 同构：市场写操作是分钟级长任务（跑 pnpm 装包），
+// 同步等必然被前面的反代 60 秒掐断 —— 所以立即 303 回后台页，真正操作放
+// goroutine 里跑，结果写回这里，页面 10 秒自动刷新呈现。
+var marketOpState struct {
+	mu      sync.Mutex
+	running bool
+	op      string
+	at      string
+	result  string
+}
+
+func marketOpSnapshot() (running bool, op, at, result string) {
+	marketOpState.mu.Lock()
+	defer marketOpState.mu.Unlock()
+	return marketOpState.running, marketOpState.op, marketOpState.at, marketOpState.result
+}
+
+// validPluginName 只放行 npm 包名字符集：这条名字会拼进命令参数与页面 HTML，
+// 宽一分就多一分注入/越权的空间。连两点（路径回溯）也明确拒绝。
+func validPluginName(s string) bool {
+	if s == "" || len(s) > 214 || strings.HasPrefix(s, "/") || strings.Contains(s, "..") {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '@', r == '/', r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validInstallURL 把关安装地址：必须是 https、必须有主机名、不许带用户名口令
+// （防 history 里漏出带凭据的 URL）。最终「在不在精选列表」由市场自己判。
+func validInstallURL(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && u.Scheme == "https" && u.Host != "" && u.User == nil
+}
+
+// marketPOST 以「回环直连」身份调市场的写路由：Host/Origin 取上游回环地址、
+// 不设任何 X-Forwarded-*（同 restartDSH 的理由），并原样带上浏览器的 Cookie ——
+// 市场当前不查会话，带上只是让请求与「用户亲手在市场页点按钮」更接近。
+// 超时给 300 秒：安装是长任务，但反正没人同步等它（见 marketOpState）。
+func marketPOST(path string, body any, cookie string) (int, string) {
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return 0, err.Error()
+	}
+	u := *upstreamURL
+	u.Path = path
+	req, err := http.NewRequest(http.MethodPost, u.String(), bytes.NewReader(buf))
+	if err != nil {
+		return 0, err.Error()
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://"+u.Host)
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	client := &http.Client{Timeout: 300 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
+	return resp.StatusCode, strings.TrimSpace(string(b))
+}
+
+// marketResultText 把市场返回码翻成给用户看的一句话。2xx 直接说「完成」
+// （成功 body 是 {"ok":true,…} 这类 JSON，没有给人看的信息）；失败时把
+// {"error":"…"} 里的正文解出来 —— 市场的中文错误提示（如「插件未安装」）
+// 本身就是答案，包一层 JSON 或让人去翻服务器日志都是浪费。
+func marketResultText(code int, detail string) string {
+	if code >= 200 && code < 300 {
+		return "完成"
+	}
+	msg := detail
+	var e struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(detail), &e) == nil && e.Error != "" {
+		msg = e.Error
+	}
+	if code == 0 {
+		return "失败：" + msg
+	}
+	return fmt.Sprintf("失败（HTTP %d）：%s", code, msg)
+}
+
+// handleMarket 后台页的插件操作入口（表单：op + name/url/enabled）。
+func handleMarket(w http.ResponseWriter, r *http.Request) {
+	if !adminPost(w, r) {
+		return
+	}
+	ip := clientIP(r)
+	op := r.FormValue("op")
+	name := strings.TrimSpace(r.FormValue("name"))
+	var body map[string]any
+	switch op {
+	case "install":
+		u := strings.TrimSpace(r.FormValue("url"))
+		if !validInstallURL(u) {
+			setAdminMsg("没执行：插件地址必须是 https:// 开头的完整网址。能装哪些由市场的精选列表决定，粘地址即可。")
+			secNote("插件操作", ip, "被拒：非法安装地址")
+			backToAdmin(w, r)
+			return
+		}
+		body = map[string]any{"url": u}
+		if v := strings.TrimSpace(r.FormValue("version")); v != "" {
+			body["version"] = v
+		}
+		name = u // 安装没有包名，事件里记地址（市场 400 会自己说不在精选列表）
+	case "toggle":
+		if !validPluginName(name) {
+			setAdminMsg("没执行：插件名不合法。")
+			secNote("插件操作", ip, "被拒：非法插件名")
+			backToAdmin(w, r)
+			return
+		}
+		body = map[string]any{"name": name, "enabled": r.FormValue("enabled") == "1"}
+	case "update", "uninstall":
+		if !validPluginName(name) {
+			setAdminMsg("没执行：插件名不合法。")
+			secNote("插件操作", ip, "被拒：非法插件名")
+			backToAdmin(w, r)
+			return
+		}
+		body = map[string]any{"name": name}
+	default:
+		setAdminMsg("没执行：不认识的插件操作（%q）。", op)
+		backToAdmin(w, r)
+		return
+	}
+	// 展示与事件用中文动作名（面向零英文用户），路由名仍用 op。
+	label := map[string]string{"install": "安装", "update": "更新", "uninstall": "卸载", "toggle": "停用"}[op]
+	if op == "toggle" && r.FormValue("enabled") == "1" {
+		label = "启用"
+	}
+	// 市场自己有两条硬规矩，先在门禁这层用中文拦下，别把英文 400 抛给用户：
+	// 插件市场不能停用/卸载自身（市场源码原文：use the dsh CLI）。
+	if (op == "toggle" || op == "uninstall") && (name == "dsh-market" || name == "dshmarket") {
+		setAdminMsg("没执行：插件市场不能停用或卸载自己，要动它请在服务器上用 dsh 命令行。")
+		secNote("插件操作", ip, "被拒：市场不允许操作自身")
+		backToAdmin(w, r)
+		return
+	}
+
+	marketOpState.mu.Lock()
+	if marketOpState.running {
+		marketOpState.mu.Unlock()
+		setAdminMsg("已有插件操作在进行，等它完成再试（进度看插件管理那一行）。")
+		backToAdmin(w, r)
+		return
+	}
+	marketOpState.running = true
+	marketOpState.op = label
+	marketOpState.at = time.Now().Format("01-02 15:04:05")
+	marketOpState.result = "进行中…"
+	cookie := r.Header.Get("Cookie")
+	marketOpState.mu.Unlock()
+
+	secNote("插件操作", ip, "发起%s：%s", label, name)
+	go func() {
+		code, detail := marketPOST("/dsh-market/"+op, body, cookie)
+		out := marketResultText(code, detail)
+		marketOpState.mu.Lock()
+		marketOpState.running = false
+		marketOpState.result = out
+		marketOpState.mu.Unlock()
+		marketInvalidate() // 列表/可更新信息立即过期，下次打开后台页就是新的
+		secNote("插件操作", ip, "%s %s → %s", label, name, out)
+	}()
+	backToAdmin(w, r)
+}
+
+// ---------- 只读市场信息（30 秒缓存） ----------
+
+// dshGetJSON 给上游发一次只读 GET 并解 JSON。Host 取上游回环地址
+// （http.NewRequest 默认就用 URL 里的 Host），与经反代转发时的身份一致。
+func dshGetJSON(path string, timeout time.Duration, out any) error {
+	u := *upstreamURL
+	u.Path = path
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+		return fmt.Errorf("HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(out)
+}
+
+// marketReadInfo 是体检面板 + 插件表要用的那几样只读数据，一次拉齐。
+type marketReadInfo struct {
+	ok         bool
+	at         time.Time
+	ver        string
+	sumOK      bool // 更新摘要这次拉到了吗（false 时不能说「已最新」）
+	updatable  int
+	latest     map[string]string // 包名 → 最新版本
+	snaps      int
+	plugins    []pluginRow
+	pluginsErr string
+}
+
+var marketRead struct {
+	mu   sync.Mutex
+	info marketReadInfo
+}
+
+const marketReadTTL = 30 * time.Second
+
+// marketInvalidate 让下一次取数立刻重拉（插件操作刚跑完时用）。
+func marketInvalidate() {
+	marketRead.mu.Lock()
+	marketRead.info.at = time.Time{}
+	marketRead.mu.Unlock()
+}
+
+// marketReadSnapshot 返回缓存的市场只读信息；过期则现场重拉。
+// 重拉失败不抛错：能用旧值用旧值，用不了就在页面上写「拉取失败」——
+// 体检面板永远不该把整张后台页拖垮。
+func marketReadSnapshot() marketReadInfo {
+	marketRead.mu.Lock()
+	stale := !marketRead.info.ok || time.Since(marketRead.info.at) > marketReadTTL
+	info := marketRead.info
+	marketRead.mu.Unlock()
+	if !stale {
+		return info
+	}
+	info = refreshMarketRead()
+	marketRead.mu.Lock()
+	marketRead.info = info
+	marketRead.mu.Unlock()
+	return info
+}
+
+type mktStatus struct {
+	Version string `json:"version"`
+	Busy    bool   `json:"busy"`
+	Phase   string `json:"phase"`
+	Last    string `json:"lastLine"`
+}
+
+type mktSummary struct {
+	Updatable int `json:"updatable"`
+	Packages  []struct {
+		Name          string `json:"name"`
+		LatestVersion string `json:"latestVersion"`
+	} `json:"packages"`
+}
+
+type mktInstalled struct {
+	Installed map[string]string `json:"installed"`
+	Disabled  []string          `json:"disabled"`
+}
+
+type mktSnaps struct {
+	Snapshots []json.RawMessage `json:"snapshots"`
+}
+
+// refreshMarketRead 四路并发拉取（status / 更新摘要 / 已装列表 / 快照），
+// 各自记各自的错：某一路挂了不至于让其它三路的数据显示不出来。
+func refreshMarketRead() marketReadInfo {
+	var (
+		wg                                  sync.WaitGroup
+		st                                  mktStatus
+		sum                                 mktSummary
+		inst                                mktInstalled
+		snaps                               mktSnaps
+		errVer, errSum, errInst, errSnaps   error
+	)
+	fetch := func(dst any, path string, errDst *error) {
+		defer wg.Done()
+		*errDst = dshGetJSON(path, 5*time.Second, dst)
+	}
+	wg.Add(4)
+	go fetch(&st, "/dsh-market/status", &errVer)
+	go fetch(&sum, "/dsh-market/api/v1/updates/summary", &errSum)
+	go fetch(&inst, "/dsh-market/installed", &errInst)
+	go fetch(&snaps, "/dsh-market/snapshots", &errSnaps)
+	wg.Wait()
+
+	info := marketReadInfo{ok: true, at: time.Now(), latest: map[string]string{}}
+	if errVer != nil {
+		info.ver = "拉取失败"
+	} else {
+		info.ver = st.Version
+	}
+	if errSum == nil {
+		info.sumOK = true
+		info.updatable = sum.Updatable
+		for _, p := range sum.Packages {
+			info.latest[p.Name] = p.LatestVersion
+		}
+	}
+	if errInst == nil {
+		disabled := map[string]bool{}
+		for _, n := range inst.Disabled {
+			disabled[n] = true
+		}
+		names := make([]string, 0, len(inst.Installed))
+		for n := range inst.Installed {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		info.plugins = make([]pluginRow, 0, len(names))
+		for _, n := range names {
+			latest := info.latest[n]
+			info.plugins = append(info.plugins, pluginRow{
+				Name: n, Spec: inst.Installed[n], Latest: latest,
+				// 摘要里只列「有更新」的包，所以见到 latest 就是可更新。
+				Updatable: latest != "",
+				Disabled:  disabled[n],
+			})
+		}
+	} else {
+		info.pluginsErr = "已装列表拉取失败：" + errInst.Error()
+	}
+	if errSnaps == nil {
+		info.snaps = len(snaps.Snapshots)
+	}
+	return info
+}
+
+// marketStatusNow 取市场进度（busy/阶段/最后一行），5 秒缓存 ——
+// 这行字每 10 秒随页面刷新，没必要每次都现场问。
+const marketStatusTTL = 5 * time.Second
+
+var marketStatusCache struct {
+	mu  sync.Mutex
+	at  time.Time
+	st  mktStatus
+	err string
+}
+
+func marketStatusNow() (mktStatus, string) {
+	marketStatusCache.mu.Lock()
+	if !marketStatusCache.at.IsZero() && time.Since(marketStatusCache.at) < marketStatusTTL {
+		st, err := marketStatusCache.st, marketStatusCache.err
+		marketStatusCache.mu.Unlock()
+		return st, err
+	}
+	marketStatusCache.mu.Unlock()
+	var st mktStatus
+	errStr := ""
+	if err := dshGetJSON("/dsh-market/status", 3*time.Second, &st); err != nil {
+		errStr = err.Error()
+	}
+	marketStatusCache.mu.Lock()
+	marketStatusCache.at, marketStatusCache.st, marketStatusCache.err = time.Now(), st, errStr
+	marketStatusCache.mu.Unlock()
+	return st, errStr
+}
+
 func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	evs, total := secSnapshot()
 	rows, nBad, nWarn, nOK, nInfo := buildRows(evs)
@@ -1395,6 +2356,47 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 		} else {
 			dshLeft = "已过期"
 		}
+	}
+	// 体检数据：市场只读信息走 30 秒缓存、进度走 5 秒缓存，都是给完超时就认输
+	// （写「拉取失败」照常出页）—— 体检卡绝不能把整张后台页拖死。
+	mkt := marketReadSnapshot()
+	st, stErr := marketStatusNow()
+	opRunning, op, opAt, opResult := marketOpSnapshot()
+	histQuery := r.URL.Query().Get("q")
+	hist := histReadRows(histQuery)
+	logPath, logSize := histSizeDesc()
+	logRotate := ""
+	if logPath != "" {
+		if histRotateSize >= 1<<20 {
+			logRotate = fmt.Sprintf("单文件满 %.0f MB 轮转、保留 %d 份", float64(histRotateSize)/(1<<20), histRotKeep)
+		} else {
+			logRotate = fmt.Sprintf("单文件满 %d KB 轮转、保留 %d 份", histRotateSize>>10, histRotKeep)
+		}
+	}
+	// 内存里的计数只覆盖最近 secLogMax 条（更早的在落盘文件里，历史卡能搜到）
+	upErrs, restarts := 0, 0
+	for _, e := range evs {
+		switch e.Kind {
+		case "上游错误":
+			upErrs++
+		case "DSH 重启":
+			restarts++
+		}
+	}
+	marketLine := st.Last
+	if marketLine == "" {
+		marketLine = stErr
+	}
+	if marketLine == "" {
+		marketLine = "—"
+	}
+	// 操作结果的配色：进行中=黄；失败/被拒/错误=红；完成=绿；还没做过=中性。
+	// 复用 toneOf 的插件操作分支，只额外处理「进行中」。
+	opTone := "info"
+	if opRunning {
+		opTone = "warn"
+	} else if opResult != "" {
+		opTone = toneOf("插件操作", opResult)
 	}
 	_ = adminTpl.Execute(w, adminView{
 		Title: siteTitle, Version: gateVersion, Uptime: humanUptime(time.Since(startedAt)),
@@ -1415,6 +2417,15 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 		StatePath: cfgPath, StateWritable: cfgWritable,
 		DSHDays: dshSessionDs, DSHOK: dshSessionFresh(r), DSHLeft: dshLeft,
 		RestartBusy: busy, RestartAt: at, RestartResult: result,
+		DshUp:      dshListening(),
+		UpErrCount: upErrs, RestartCount: restarts,
+		MarketVer: mkt.ver, UpdateCount: mkt.updatable, UpdatesOK: mkt.sumOK, SnapshotCount: mkt.snaps,
+		MarketBusy: st.Busy, MarketPhase: st.Phase, MarketLine: marketLine,
+		Plugins:     mkt.plugins, PluginsErr: mkt.pluginsErr,
+		OpRunning: opRunning, Op: op, OpAt: opAt, OpResult: opResult, OpTone: opTone,
+		LogPath: logPath, LogSize: logSize, LogRotate: logRotate,
+		Hist: hist, HistShown: len(hist), HistQuery: histQuery, HistCap: histRowsMax,
+		Epoch: cfg.SessionEpoch,
 	})
 }
 
@@ -1435,6 +2446,9 @@ type githubConfig struct {
 type gateConfig struct {
 	TOTPEnabled *bool        `json:"totpEnabled,omitempty"`
 	GitHub      githubConfig `json:"github"`
+	// SessionEpoch 是「登录代数」：每踢一次光（/__gate/logout-all）+1，
+	// 全体旧 Cookie（含未过期的）因代数对不上当场作废。0 = 还没踢过。
+	SessionEpoch int64 `json:"sessionEpoch,omitempty"`
 }
 
 var (
@@ -1988,13 +3002,27 @@ func withGate(next http.Handler) http.Handler {
 			case gatePrefix + "/repair":
 				handleRepair(w, r)
 				return
+			case gatePrefix + "/logout-all":
+				// 一键踢光所有设备（1.8.0）：会话代数 +1，全部旧 Cookie 作废
+				handleLogoutAll(w, r)
+				return
+			case gatePrefix + "/market":
+				// 插件安装/启停/更新/卸载（1.8.0）：转给市场，异步执行
+				handleMarket(w, r)
+				return
 			}
 			// ★ 下面这些接口族自带 loopback 围栏，但**不校验 DSH 会话**：实测不带
 			//   任何 DSH Cookie 一样返回 200。只放行回环身份就等于把「门禁 + DSH 令牌」
 			//   压成一层 —— 远端执行接口能在用户配置的所有主机上执行命令，配置管理器
 			//   能导出配置，搜索设置能读改写上游凭据。所以这里加第二层：
 			//   DSH 真的认这个会话，且没有超出本地记录的有效期，才放行（fail-closed）。
-			if sessionRequiredPath(r.URL.Path) && !dshSessionFresh(r) {
+			//
+			// 1.8.0 再把 20 条市场写路由（marketMutationPaths，install/uninstall/
+			//   toggle/…）一并纳入：2026-10-03 读 dshmarket 源码确认，这些写接口
+			//   自身只有 sameOrigin 一道门、**没有任何会话检查**，而它们能改插件
+			//   的安装与启停 —— 同样不能只靠门禁一层。读路由（installed/status 等）
+			//   保持原样，不拦只读数据。
+			if (sessionRequiredPath(r.URL.Path) || marketMutationPath(r.URL.Path)) && !dshSessionFresh(r) {
 				secNote("接口缺有效 DSH 会话", clientIP(r), "%s %s", r.Method, r.URL.Path)
 				http.Error(w, "需要有效的 DSH 会话", http.StatusForbidden)
 				return
@@ -2404,6 +3432,49 @@ func main() {
 	// 后台可改的配置（落盘）。放在 fail-closed 之前：GitHub 登录就是在后台开的，
 	// 关掉动态密码后能不能启动，取决于这个文件读得读不出来。
 	loadConfig(env("GATE_STATE", "/data/state.json"))
+
+	// 历史日志落盘（1.8.0）。GATE_LOG：
+	//   缺省 = 状态文件同目录 log.jsonl（跟着 GATE_STATE 走，即 /data 卷）
+	//   显式 off / 0 / false = 关闭
+	//   其它 = 指定路径（目录自动创建 0700、文件 0600）
+	logPath := strings.TrimSpace(os.Getenv("GATE_LOG"))
+	if strings.EqualFold(logPath, "off") || logPath == "0" || strings.EqualFold(logPath, "false") {
+		logPath = ""
+	} else if logPath == "" && cfgPath != "" {
+		logPath = filepath.Join(filepath.Dir(cfgPath), "log.jsonl")
+	}
+	if b := strings.TrimSpace(os.Getenv("GATE_LOG_BYTES")); b != "" {
+		if n, err := strconv.Atoi(b); err == nil && n >= 4096 {
+			histRotateSize = int64(n)
+		}
+	}
+	if logPath != "" {
+		if err := histOpen(logPath); err != nil {
+			secNote("历史日志", "-", "落盘打开失败（%v），本次运行只记内存", err)
+		}
+	}
+	// 落盘/巡检状态给启动横幅用（放在 histOpen 之后才是真实状态）
+	logDesc := "关"
+	if p, _ := histSizeDesc(); p != "" {
+		logDesc = p
+	}
+
+	// DSH 健康巡检（1.8.0）：GATE_HEALTH_INTERVAL 秒探一次上游，
+	//   0 = 关。事件判据在 healthState.step：首通记「就绪」（不冒充重启）、
+	//   连挂 3 次记一次「不可达」、由停转通记「重启（中断 X 秒）」。
+	hi := 5
+	if v := strings.TrimSpace(os.Getenv("GATE_HEALTH_INTERVAL")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			hi = n
+		}
+	}
+	healthDesc := "关"
+	if hi > 0 {
+		healthInterval = time.Duration(hi) * time.Second
+		healthDesc = healthInterval.String()
+		go healthLoop()
+	}
+
 	if pw, totp, gh := loginModes(); !pw && !totp && !gh {
 		log.Fatal("门禁未配置：既没有口令，也没有可用的动态验证码 / GitHub 登录 —— 拒绝启动（fail-closed）。请运行 scripts/set-totp.sh，或先在后台配好 GitHub 登录")
 	}
@@ -2414,8 +3485,8 @@ func main() {
 	}
 	upstreamURL = target
 
-	secNote("启动", "-", "v%s 监听 %s → %s（%s，会话=%d 天，DSH 会话=%d 天，注入=%v，时区=%s）",
-		gateVersion, listen, target, modesSummary(), sessionDs, dshSessionDs, inject, time.Local.String())
+	secNote("启动", "-", "v%s 监听 %s → %s（%s，会话=%d 天，DSH 会话=%d 天，注入=%v，时区=%s，历史落盘=%s，巡检=%s）",
+		gateVersion, listen, target, modesSummary(), sessionDs, dshSessionDs, inject, time.Local.String(), logDesc, healthDesc)
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           withGate(newProxy(target, inject)),

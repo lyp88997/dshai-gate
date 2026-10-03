@@ -3,6 +3,9 @@ package main
 import (
 	"io"
 	"log"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -293,5 +296,234 @@ func TestLoginGithubButtonCarriesOwnColors(t *testing.T) {
 		if n := strings.Count(page, hook); n != 1 {
 			t.Errorf("%s 应恰好 1 个，实际 %d", hook, n)
 		}
+	}
+}
+
+// ==================== 1.8.0 新功能 ====================
+
+// resetHist 把落盘状态恢复成「未启用」，关掉上一个测试留下的句柄。
+func resetHist(t *testing.T) {
+	t.Helper()
+	histMu.Lock()
+	if histF != nil {
+		_ = histF.Close()
+	}
+	histF = nil
+	histPath = ""
+	histSize = 0
+	histWErr = ""
+	histWarned = false
+	histLast = map[string]time.Time{}
+	histDelta = map[string]int{}
+	histWindowAt = time.Time{}
+	histWindowN, histSuppressed = 0, 0
+	histRotateSize = histRotateBytes
+	histMu.Unlock()
+}
+
+// 落盘限速窗口：一窗最多 histBurst 行，溢出先攒着，窗口翻篇补一条汇总。
+func TestHistDecisionWindow(t *testing.T) {
+	resetHist(t)
+	t0 := time.Now()
+	histMu.Lock()
+	defer histMu.Unlock()
+	for i := 0; i < histBurst; i++ {
+		allow, summary := histDecision(t0)
+		if !allow || summary != "" {
+			t.Fatalf("第 %d 行应放行且无汇总，实际 allow=%v summary=%q", i+1, allow, summary)
+		}
+	}
+	if allow, _ := histDecision(t0); allow {
+		t.Fatal("超出窗口配额应拒绝")
+	}
+	allow, summary := histDecision(t0.Add(histWindowLen))
+	if !allow {
+		t.Fatal("新窗口第一行应放行")
+	}
+	if summary == "" {
+		t.Fatal("上一窗被限速的行应在翻篇时补一条汇总")
+	}
+	if !strings.Contains(summary, "另有") {
+		t.Fatalf("汇总文案应说明被限速条数，实际 %q", summary)
+	}
+}
+
+// 落盘端到端：写 → 节流合并 → 读回 → 关键词过滤。
+func TestHistAppendAndReadBack(t *testing.T) {
+	resetHist(t)
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	if err := histOpen(path); err != nil {
+		t.Fatalf("histOpen: %v", err)
+	}
+	t.Cleanup(func() { resetHist(t) })
+
+	histAppend("插件操作", "1.2.3.4", "更新 foo → 完成", false)
+	histAppend("插件操作", "1.2.3.4", "更新 foo → 完成", true) // 节流期内的合并：不写新行
+	rows := histReadRows("")
+	if len(rows) != 1 {
+		t.Fatalf("合并行不该重复落盘，期望 1 行，实际 %d 行", len(rows))
+	}
+	if rows[0].Tone != "ok" {
+		t.Errorf("完成类事件配色应为 ok，实际 %q", rows[0].Tone)
+	}
+	if got := histReadRows("FOO"); len(got) != 1 {
+		t.Errorf("过滤应大小写不敏感地命中说明文字，实际 %d 行", len(got))
+	}
+	if got := histReadRows("9.9.9.9"); len(got) != 0 {
+		t.Errorf("不匹配的关键词应 0 行，实际 %d 行", len(got))
+	}
+}
+
+// 轮转：超阈值挪成 .1（继续涨继续挪），新文件接着写。
+func TestHistRotation(t *testing.T) {
+	resetHist(t)
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	histRotateSize = 300 // 一行 JSONL 约百字节，几行就该轮
+	if err := histOpen(path); err != nil {
+		t.Fatalf("histOpen: %v", err)
+	}
+	t.Cleanup(func() { resetHist(t) })
+	for i := 0; i < 12; i++ {
+		histAppend("历史日志", "1.1.1.1", "轮转测试行 "+strconv.Itoa(i), false)
+	}
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Fatalf("超过阈值应轮转出 .1：%v", err)
+	}
+	if rows := histReadRows("轮转测试行"); len(rows) == 0 {
+		t.Fatal("轮转后新文件里的行应能读回")
+	}
+}
+
+// 健康巡检状态机：首通记就绪（不冒充重启）、连挂 healthFails 次记一次
+// 不可达、恢复记重启且带真实离线时长。
+func TestHealthStepStates(t *testing.T) {
+	var h healthState
+	t0 := time.Now()
+	if kind, _ := h.step(true, t0); kind != "DSH 就绪" {
+		t.Fatalf("首次探通应记「DSH 就绪」，实际 %q", kind)
+	}
+	if kind, _ := h.step(true, t0.Add(5*time.Second)); kind != "" {
+		t.Fatalf("一直通应安静，实际 %q", kind)
+	}
+	if kind, _ := h.step(false, t0.Add(10*time.Second)); kind != "" {
+		t.Fatalf("单次抖动不该记事件，实际 %q", kind)
+	}
+	if kind, _ := h.step(false, t0.Add(11*time.Second)); kind != "" {
+		t.Fatalf("第 2 次抖动仍不该记事件，实际 %q", kind)
+	}
+	t2 := t0.Add(20 * time.Second)
+	if kind, _ := h.step(false, t2); kind != "DSH 不可达" {
+		t.Fatalf("连续 %d 次不通应记「DSH 不可达」，实际 %q", healthFails, kind)
+	}
+	if kind, _ := h.step(false, t2.Add(5*time.Second)); kind != "" {
+		t.Fatalf("不可达只记一次，实际 %q", kind)
+	}
+	kind, text := h.step(true, t2.Add(40*time.Second))
+	if kind != "DSH 重启" {
+		t.Fatalf("恢复应记「DSH 重启」，实际 %q", kind)
+	}
+	if !strings.Contains(text, "40s") {
+		t.Fatalf("重启事件应带离线时长 40s，实际 %q", text)
+	}
+}
+
+// 会话代数：旧三段在 epoch=0 时有效；代数 +1（踢光）后，旧 Cookie 即使
+// 没到期也全部作废，新代 Cookie 才能进门；篡改过期时间验签必须失败。
+func TestSessionEpochCookies(t *testing.T) {
+	oldSecret, oldCfg := secret, cfg
+	t.Cleanup(func() { secret, cfg = oldSecret, oldCfg })
+	secret = "test-secret-0123456789"
+	cfg = gateConfig{} // epoch 0
+
+	exp := time.Now().Add(time.Hour).Unix()
+	v0 := signSession("v1", exp, 0)
+	if strings.Count(v0, ".") != 2 {
+		t.Fatalf("epoch=0 应保持旧三段格式（向后兼容），实际 %q", v0)
+	}
+	if got, ok := sessionSignedExp(v0); !ok || got != exp {
+		t.Fatalf("epoch=0 的三段 Cookie 应有效，实际 ok=%v exp=%d", ok, got)
+	}
+
+	v1 := signSession("v1", exp, 1)
+	if strings.Count(v1, ".") != 3 {
+		t.Fatalf("epoch>0 应是四段（多出代数段），实际 %q", v1)
+	}
+	if _, ok := sessionSignedExp(v1); ok {
+		t.Fatal("代数不符的 Cookie 必须拒（还没踢就拿到「未来代」的票）")
+	}
+
+	// 踢光：代数 +1
+	cfgMu.Lock()
+	cfg.SessionEpoch = 1
+	cfgMu.Unlock()
+	if _, ok := sessionSignedExp(v1); !ok {
+		t.Fatal("踢光后本机新代 Cookie 应有效")
+	}
+	if _, ok := sessionSignedExp(v0); ok {
+		t.Fatal("踢光后旧三段 Cookie 必须作废（哪怕没到期）")
+	}
+
+	// 篡改过期时间不改签名 → 拒
+	parts := strings.Split(v1, ".")
+	forged := "v1." + strconv.FormatInt(exp+60, 10) + "." + parts[2] + "." + parts[3]
+	if _, ok := sessionSignedExp(forged); ok {
+		t.Fatal("篡改过期时间应验签失败")
+	}
+}
+
+// 插件操作的入参把关：名字只许 npm 包名字符，地址必须 https。
+func TestPluginInputValidation(t *testing.T) {
+	for _, s := range []string{"dshmarket", "@scope/pkg", "pkg.name_v2", "a-b_c"} {
+		if !validPluginName(s) {
+			t.Errorf("%q 应是合法插件名", s)
+		}
+	}
+	for _, s := range []string{"", "a b", "a;rm -rf /", "/abs", "..", "a/../b", "a\x00b", strings.Repeat("x", 215)} {
+		if validPluginName(s) {
+			t.Errorf("%q 必须判为非法插件名", s)
+		}
+	}
+	for _, s := range []string{"https://github.com/x/y", "https://registry.npmjs.org/p"} {
+		if !validInstallURL(s) {
+			t.Errorf("%q 应是合法安装地址", s)
+		}
+	}
+	for _, s := range []string{"", "http://x/y", "ftp://x/y", "https://user:pass@h/p", "javascript:alert(1)", "notaurl"} {
+		if validInstallURL(s) {
+			t.Errorf("%q 必须判为非法安装地址", s)
+		}
+	}
+}
+
+// 第二层补强（1.8.0）：20 条市场写路由自身零会话检查，必须和读路由分清 ——
+// 写的进第二层，读的保持不拦（只读数据拦了只会把面板弄坏）。
+func TestMarketWritesNeedSecondLayer(t *testing.T) {
+	if len(marketMutationPaths) != 20 {
+		t.Fatalf("市场写路由应恰为 20 条，实际 %d 条（改动要同步改注释与测试）", len(marketMutationPaths))
+	}
+	for p := range marketMutationPaths {
+		if !(sessionRequiredPath(p) || marketMutationPath(p)) {
+			t.Errorf("%s 的市场写路由没进第二层：市场自身零会话检查", p)
+		}
+	}
+	for _, p := range []string{"/dsh-market/installed", "/dsh-market/status",
+		"/dsh-market/api/v1/updates/summary", "/dsh-market/snapshots", "/dsh-market/registry"} {
+		if sessionRequiredPath(p) || marketMutationPath(p) {
+			t.Errorf("%s 是只读路由，不该被第二层拦、也不该被改写身份", p)
+		}
+	}
+}
+
+// 插件操作结果翻给用户看的话：成功说完成，失败要把市场的错误正文解出来。
+func TestMarketResultText(t *testing.T) {
+	if got := marketResultText(200, `{"ok":true}`); got != "完成" {
+		t.Errorf("2xx 应说完成，实际 %q", got)
+	}
+	if got := marketResultText(0, "connection refused"); got != "失败：connection refused" {
+		t.Errorf("连接错误应原样带出，实际 %q", got)
+	}
+	got := marketResultText(400, `{"error":"plugin is not installed"}`)
+	if !strings.Contains(got, "HTTP 400") || !strings.Contains(got, "plugin is not installed") {
+		t.Errorf("失败应同时带状态码与错误正文，实际 %q", got)
 	}
 }
