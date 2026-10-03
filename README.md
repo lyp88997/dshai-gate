@@ -13,9 +13,9 @@
 
 把**只肯监听回环**的 DSH，安全地接到公网 —— 顺便把远端访问会踩的五个坑一次填平。
 
-<img src="docs/login.png" width="820" alt="dshai-gate 登录页：动态验证码 + DSH 令牌">
+<img src="docs/login.png" width="820" alt="dshai-gate 登录页：GitHub 登录按钮 + 动态验证码 + DSH 令牌">
 
-<sub>登录页（1.7.2 实拍）：动态验证码（TOTP）+ DSH 令牌。已有会话时令牌可留空，没有时会自动变成必填；1.7.0 起也可以改用 GitHub 账号登录，图里最上面那个按钮就是。</sub>
+<sub>登录页（1.7.3 实拍）：上面是按需出现的 GitHub 登录按钮，下面是动态验证码（TOTP）与 DSH 令牌。已有会话时令牌可留空，没有时会自动变成必填。</sub>
 
 </div>
 
@@ -133,7 +133,7 @@ location / {
 
 - 动态码为标准 **RFC 6238**（HMAC-SHA1 / 30 秒 / 6 位），与 Google Authenticator、Microsoft Authenticator、Aegis、1Password、Bitwarden 等通用
 - 会话为服务端 **HMAC 签名 Cookie**：`HttpOnly; Secure; SameSite=Lax`，默认 30 天
-- 登录页是单文件内嵌 HTML（**深色玻璃拟态、跟随系统深浅色、6 位码满位自动提交、`autocomplete="one-time-code"` 支持手机自动填码、取令牌命令一键复制**）
+- 登录页是单文件内嵌 HTML（**深色玻璃拟态、跟随系统深浅色、6 位码满位自动提交、`autocomplete="one-time-code"` 支持手机自动填码、取令牌命令一键复制**）；1.7.3 起前景色与底色**成对定义**（浅色偏好下不再出现白字白底），并补了窄屏与「减少动态效果」两段媒体查询
 - **1.7.0 起，动态码开关与 GitHub 登录可以在后台页里改**，不用进服务器改环境变量；**关掉的登录方式在前台登录页会自动隐藏**（没有动态码就不显示那个输入框，没有 GitHub 就不显示那个按钮）
 
 ### 防爆破（四层）
@@ -344,6 +344,7 @@ bash scripts/set-password.sh    # 设置口令（明文不落盘、不进 shell 
 | **页面突然点不动、接口全 401，但登录页本身还能开** | 门禁会话还有效，DSH 自己那层已经失效 | 刷新页面 → 回到登录页 → 填 DSH 令牌重新配对（1.6.0 起导航会自动回登录页，见[会话失效时会怎样](#会话失效时会怎样)） |
 | 日志里**所有**「上游错误」的 IP 都是 `127.0.0.1` | 1.6.0 之前记的是**出站**请求，其 `X-Forwarded-For` 末尾是 nginx 自己 | 升级到 1.6.0（已改为用入站请求取 IP，安全日志才有归因） |
 | 后台页与日志时间比本地**早 8 小时** | 容器时区是 UTC，且镜像里没有 zoneinfo | 1.6.0 起时区库已内嵌，设 `TZ`（compose 默认 `Asia/Shanghai`）即可 |
+| 系统是**浅色**偏好时，登录页上的按钮**白字看不见** | 样式只给了 `color` 没给 `background`（旧版 `@media (prefers-color-scheme: light){a.go{color:#fff}}` 就是如此），白字直接压在白卡片上，对比度 1:1 | 1.7.3 起前景/底色成对写（`color:var(--fg)` 配 `background:var(--surface)`），浅色实测 14.99:1；`main_test.go` 的 `TestLoginGithubButtonCarriesOwnColors` 会在只给颜色时让测试失败 |
 | 把自己锁在门外 | 忘了动态码 / 丢了手机 | 在**服务器上**重跑 `scripts/set-totp.sh` 换新密钥；若已配好 GitHub 登录，也可用 GitHub 账号进去 |
 | 后台页改了设置（GitHub 配置、动态码开关），**重启后又变回去** | `GATE_STATE` 所在目录容器写不进去（镜像内以 65534 运行） | 宿主上 `mkdir -p /opt/dshai/gate-data && chown 65534:65534 /opt/dshai/gate-data`，再重建门禁容器；后台页会显示「改动只在内存里生效」的提醒 |
 | 想关掉动态码，后台却拒绝并提示「没改」 | 关掉之后一种能用的登录方式都不剩（GitHub 没配全 / 没填白名单） | 先把 GitHub 登录配全并验证能进，再关动态码 —— 这是有意为之 |
