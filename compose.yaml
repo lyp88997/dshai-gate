@@ -5,8 +5,12 @@ services:
     build:
       context: .
       args:
-        DSH_VERSION: "0.2.0-rc.2"
-    image: dsh-official:0.2.0-rc.2
+        # DSH 版本是**钉死**的，不会跟着 npm 上的最新版跑。默认值写在这里；
+        # 想临时试别的版本不必改文件：DSH_VERSION=0.2.1 docker compose build dsh
+        # （也可以写进同目录的 .env）。image 标签用同一个变量，免得出现
+        # 「镜像名对不上、内容已是新版」的情况。
+        DSH_VERSION: "${DSH_VERSION:-0.2.0-rc.2}"
+    image: dsh-official:${DSH_VERSION:-0.2.0-rc.2}
     container_name: dshai-web
     restart: unless-stopped
     init: true

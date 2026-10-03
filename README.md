@@ -120,6 +120,15 @@ location / {
 
 然后打开你的域名，会看到登录页。
 
+> **DSH 用哪个版本？钉死的，不跟“最新”。** `compose.yaml` 里写的是
+> `DSH_VERSION: "${DSH_VERSION:-0.2.0-rc.2}"`，`Dockerfile` 的 `ARG` 默认值也是同一个 ——
+> 别人部署拿到的是**已验证过的那个版本**，不会哪天 npm 发了新版就悄悄升级。
+> 换版本改这个默认值即可（构建参数与 `image:` 标签共用同一个变量，不会对不上），
+> 也可以不动文件临时指定：`DSH_VERSION=0.2.1 docker compose build dsh && docker compose up -d dsh`。
+> ⚠️ **换核心版本时，插件树必须跟着换**：2026-10-02 那次故障就是核心还是 0.1.5、
+> 插件树已经升级到 0.2.0 造成的（新插件要求核心提供 `configForms`，老核心没有）。
+> 升级前先备份 `data/`（含插件目录）与 `compose.yaml`。
+
 ## 身份门禁
 
 三种模式，由环境变量决定 —— **一个都不配则拒绝启动**（fail-closed）：
@@ -321,6 +330,13 @@ DSH 启动时会打印一个一次性配对链接（`http://127.0.0.1:3082/?toke
 | `GATE_TOTP_SECRET` | — | Base32 的 TOTP 密钥（可含空格、大小写不敏感） |
 | `GATE_SESSION_SECRET` | — | 会话签名密钥，至少 16 字节 |
 | `TZ` | `Asia/Shanghai`（compose 默认） | 日志与后台页时间用的时区。本服务镜像基于 alpine、**没有 zoneinfo**，时区库是编译进二进制的（`_ "time/tzdata"`），所以独立二进制也生效；不设则退回 UTC |
+
+上面是门禁自己的变量。DSH 侧由 `compose.yaml` 控制，常用的就两个：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DSH_VERSION` | `0.2.0-rc.2` | 构建 DSH 镜像时安装的 `@deepseek-ai/dsh` 版本。**钉死**，不是“最新”；`build.args` 与 `image:` 标签共用这一个变量 |
+| `DSH_TRUSTED_HOST` | `dsh.example.com` | 你的域名，填进 `--trusted-host` 与 `DSH_WEB_URL`；用 https 访问时必须是它 |
 
 生成凭据的两个小工具（见 [运维脚本](#运维脚本)）：
 
