@@ -5,8 +5,8 @@ services:
     build:
       context: .
       args:
-        DSH_VERSION: "0.1.5-rc.3"
-    image: dsh-official:0.1.5-rc.3
+        DSH_VERSION: "0.2.0-rc.2"
+    image: dsh-official:0.2.0-rc.2
     container_name: dshai-web
     restart: unless-stopped
     init: true
