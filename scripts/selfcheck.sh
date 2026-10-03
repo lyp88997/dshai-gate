@@ -20,7 +20,12 @@ code=$(curl -s -o /tmp/.sc_login -m 8 -w '%{http_code}' -H 'Accept: text/html' h
 chk "未登录首页状态" "$code" "401"
 chk "未登录返回登录页" "$(grep -c 'action="/__gate/login"' /tmp/.sc_login 2>/dev/null)" "1"
 chk "登录页不泄露DSH内容" "$(grep -c 'dsh web auth\|__DSH_TRANSPORT__' /tmp/.sc_login 2>/dev/null)" "0"
-chk "登录页含 DSH 令牌框" "$(grep -c 'name="dstoken"' /tmp/.sc_login 2>/dev/null)" "1"
+# 1.9.0：配了 GATE_DSH_SESSION_KEY（非空）登录页就不再显示令牌框（登录自动获取），
+# 没配则必须显示；配了 GATE_USERNAME 则必须多一个用户名框。按 .env 实配算期望。
+if grep -qE '^GATE_DSH_SESSION_KEY=.+' .env 2>/dev/null; then tok=0; else tok=1; fi
+chk "登录页令牌框(按配置)" "$(grep -c 'name="dstoken"' /tmp/.sc_login 2>/dev/null)" "$tok"
+if grep -qE '^GATE_USERNAME=.+' .env 2>/dev/null; then usr=1; else usr=0; fi
+chk "登录页用户名框(按配置)" "$(grep -c 'name="username"' /tmp/.sc_login 2>/dev/null)" "$usr"
 chk "未登录 API 被拦" "$(curl -s -o /dev/null -m 8 -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:2299/api/settings.describe)" "401"
 chk "开放路由已被门禁挡" "$(curl -s -o /dev/null -m 8 -w '%{http_code}' http://127.0.0.1:2299/plugins/events)" "401"
 chk "门禁已启用(启动日志)" "$(docker logs dshai-gate 2>&1 | grep -E '门禁：启动|dshai-gate 启动' | tail -1 | grep -c .)" "1"

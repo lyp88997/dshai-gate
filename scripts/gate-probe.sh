@@ -152,7 +152,11 @@ if [ "$NAVCODE" = "401" ] && grep -q 'action="/__gate/login"' /tmp/expire.out; t
 else
   printf '  %-42s [%s] ✗ 未回登录页（DSH 裸 401 被透传？）\n' "仅门禁会话 + 导航 GET /" "$NAVCODE"
 fi
-printf '  %-42s %s 处（应为 1）\n' "登录页含 DSH 令牌输入框" "$(grep -c 'name="dstoken"' /tmp/expire.out)"
+# 1.9.0：配了 GATE_DSH_SESSION_KEY 则令牌框应当消失（登录时自动获取），没配则应当在。
+if grep -qE '^GATE_DSH_SESSION_KEY=.+' "$ENVF" 2>/dev/null; then TOKEXP=0; else TOKEXP=1; fi
+TOKN=$(grep -c 'name="dstoken"' /tmp/expire.out || true)
+if [ "$TOKN" = "$TOKEXP" ]; then TOKR="✓ 与配置一致"; else TOKR="✗ 与配置不符（期望 $TOKEXP 处）"; fi
+printf '  %-42s [%s 处] %s\n' "登录页 DSH 令牌输入框" "$TOKN" "$TOKR"
 XRCODE=$(curl -s -o /tmp/expire.out -w '%{http_code}' -H "Host: $HOSTHDR" \
   -b "$GATECOOKIE" -H 'Accept: application/json' "$GATE/")
 if [ "$XRCODE" = "401" ] && ! grep -q '__gate/login' /tmp/expire.out; then
