@@ -57,7 +57,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.7.2"
+	gateVersion  = "1.7.3"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 

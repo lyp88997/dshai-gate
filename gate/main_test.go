@@ -257,3 +257,41 @@ func TestMarketClientPrefixRoutes(t *testing.T) {
 		}
 	}
 }
+
+// cssRuleOf 取出 selector 到下一条规则之前的声明块（含 selector 本身）。
+// 只够用来看一条扁平规则，不处理嵌套。
+func cssRuleOf(css, selector string) string {
+	i := strings.Index(css, selector)
+	if i < 0 {
+		return ""
+	}
+	j := strings.Index(css[i:], "}")
+	if j < 0 {
+		return ""
+	}
+	return css[i : i+j+1]
+}
+
+// 登录页的 GitHub 按钮必须自带「成对」的前景与底色：线上那次白字就是因为
+// 旧规则只给颜色不给底（浅色偏好下 white on white，对比度 1:1）。顺带锁住
+// 探针 ④/⑩ 依赖的两个钩子（令牌输入框、复制按钮各一个）。
+func TestLoginGithubButtonCarriesOwnColors(t *testing.T) {
+	page := string(loginBytes(loginView{
+		Title: "t", HasGitHub: true, NeedTOTP: true, TokenNeeded: true, Next: "/x",
+	}))
+	if n := strings.Count(page, `class="gh"`); n != 1 {
+		t.Fatalf("GitHub 按钮应有且仅有 1 个，实际 %d", n)
+	}
+	rule := cssRuleOf(page, ".gh{")
+	if rule == "" {
+		t.Fatal("登录页缺少 .gh 样式规则")
+	}
+	if !strings.Contains(rule, "color:var(") || !strings.Contains(rule, "background:var(") {
+		t.Fatalf("GitHub 按钮必须同时声明前景与底色（否则浅色偏好下会白字白底），实际：%q", rule)
+	}
+	for _, hook := range []string{`name="dstoken"`, "data-copy="} {
+		if n := strings.Count(page, hook); n != 1 {
+			t.Errorf("%s 应恰好 1 个，实际 %d", hook, n)
+		}
+	}
+}
