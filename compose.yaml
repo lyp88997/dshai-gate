@@ -29,8 +29,10 @@ services:
     # ★ 不要用 docker update 手工改大了事：那不会写回本文件，
     #   下一次 docker compose up -d 重建容器时会悄悄改回这里的值（2026-09-27 实测踩到过：
     #   容器实际是 2g，本文件却是 1400m）。要调就改这里再重建。
-    mem_limit: 2560m
-    memswap_limit: 3584m
+    # 2026-10-04：dsh 容器被 memcg OOM 杀过一次（01:27 MainThread），按要求调大到 2.8g。
+    #   宿主 3858m，2.8g=2867m 后宿主+其他容器约剩 300m 余量；要回退就改回 2560m 重建。
+    mem_limit: 2.8g
+    memswap_limit: 3.8g
     # 崩溃转储会落到工作目录（core_pattern=core），一次 1.5GB，直接关掉
     ulimits:
       core: 0
