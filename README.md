@@ -345,6 +345,11 @@ DSH 启动时会打印一个一次性配对链接（`http://127.0.0.1:3082/?toke
 - **自动刷新不整页**：后台「自动刷新」不再 `location.reload()` 整页重载，改成 fetch 后端页面 + `DOMParser` **按 id 只换数据区**（运行时长、重启状态行、状态格、插件数据区、事件/历史日志行等）——焦点、展开状态、筛选条件、输入到一半的内容全部保留；正在输入的区块本轮跳过，后端页面结构变了自动回退整页刷新，会话过期则跳回登录页。市场/DSH 版本「获取中」时依然 3 秒一刷、平时 10 秒。
 - **第 1 步副标题点明步骤**：两步登录的第 1 步副标题显示「第 1 步 · 输入用户名与口令」，与第 2 步呼应，用户一眼知道自己在上半程；单步模式仍用原副标题。
 
+### 访问域名设置（1.11.0）
+
+- **后台改域名**：后台页新增「访问域名」卡——名单里的域名才放行（**防 DNS 重绑**：别人把域名指到你家路由、浏览器直接打 `127.0.0.1:2299`，Host 不在名单里一律 403，HTML 请求给指引页、API 请求给 JSON）。名单一行一个，裸域名可带 `:端口`，保存时统一小写、去重、逐行校验（**一行不合法整批不收**，错误指到第几行）；`.env` 里的 `DSH_TRUSTED_HOST` 是基础域名，恒在名单、后台删不掉（要改去 `.env`）。
+- **同步 DSH 白名单**：配了 `GATE_DSH_PATCH` 后，保存名单会自动重写该文件（原子写）为 DSH 的 `--patch` 覆盖层：`trustedHosts: !!js "['你的域名', ...ctx.webRuntime.trustedHosts]"`——门禁自己的 403 和 DSH 的 `/api` 围栏（`isTrustedApiRequest`）用同一份名单。**DSH 不热加载，改完点页顶「重启 DSH」才生效**；名单为空则文件写成 `[]`（不覆盖任何东西）。后台每次进页还会自检一遍文件，写失败直接黄条告警。
+
 ## 配置项
 
 | 环境变量 | 默认值 | 说明 |
@@ -366,6 +371,7 @@ DSH 启动时会打印一个一次性配对链接（`http://127.0.0.1:3082/?toke
 | `GATE_SESSION_SECRET` | — | 会话签名密钥，至少 16 字节 |
 | `GATE_USERNAME` | — | **登录用户名（1.9.0）**：配了登录页就多一个用户名框（三要素）。**必须与 `GATE_PASSWORD_HASH` 同时配**，否则拒绝启动；留空 = 不要用户名框 |
 | `GATE_DSH_SESSION_KEY` | — | **DSH 会话自动获取（1.9.0）**：DSH `.credentials.yaml` 里 `client-connection/browser-session` 的 32 字节 secret（base64url，43 字符）。配上后登录页不再显示「DSH 令牌」框、登录时门禁自签会话 Cookie（与 DSH 不匹配会明确报错）；留空 = 保持旧行为 |
+| `GATE_DSH_PATCH` | — | **DSH 白名单同步（1.11.0）**：DSH `--patch` 文件的路径（compose 里 = `/data/dsh-patch.yml` = 宿主 `gate-data/dsh-patch.yml`，dsh 以只读卷挂为 `/gate-patch/dsh-patch.yml`）。配了它，后台改域名就自动重写这份文件；留空 = 不同步（门禁自己的 Host 白名单照常工作） |
 | `TZ` | `Asia/Shanghai`（compose 默认） | 日志与后台页时间用的时区。本服务镜像基于 alpine、**没有 zoneinfo**，时区库是编译进二进制的（`_ "time/tzdata"`），所以独立二进制也生效；不设则退回 UTC |
 
 上面是门禁自己的变量。DSH 侧由 `compose.yaml` 控制，常用的就两个：
@@ -373,7 +379,7 @@ DSH 启动时会打印一个一次性配对链接（`http://127.0.0.1:3082/?toke
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `DSH_VERSION` | `0.2.0-rc.2` | 构建 DSH 镜像时安装的 `@deepseek-ai/dsh` 版本。**钉死**，不是“最新”；`build.args` 与 `image:` 标签共用这一个变量 |
-| `DSH_TRUSTED_HOST` | `dsh.example.com` | 你的域名，填进 `--trusted-host` 与 `DSH_WEB_URL`；用 https 访问时必须是它 |
+| `DSH_TRUSTED_HOST` | `dsh.example.com` | 你的域名，填进 `--trusted-host` 与 `DSH_WEB_URL`；用 https 访问时必须是它。**1.11.0 起门禁也读它当「基础域名」**：恒在放行名单、后台删不掉（compose 同值注入两侧） |
 
 生成凭据的两个小工具（见 [运维脚本](#运维脚本)）：
 

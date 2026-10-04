@@ -45,7 +45,20 @@ services:
       - ./workspaces:/home/node/workspaces
       - ./home:/home/node
       - ./plugins:/home/node/plugins:ro
-    command: ["web", "--no-open", "--port", "3082",
+      # 1.11.0：门禁把域名名单写进自己的卷（gate-data/dsh-patch.yml），这里只读
+      # 挂整目录供 --patch 读。挂目录不挂单文件：门禁原子写（rename）换 inode，
+      # 单文件挂载会卡在旧内容上。卷内 state.json/log.jsonl 都是 0600（门禁 uid
+      # 65534），dsh 的 uid1000 读不到，不会漏密。
+      - ./gate-data:/gate-patch:ro
+    command: ["web",
+              # 1.11.0 域名设置：DSH 启动读的白名单 patch（门禁后台「访问域名」写）。
+              # ★ 位置有讲究：--patch 是**启动器**旗标，必须排在第一个应用旗标
+              #   （--no-open）之前——启动器碰到第一个不认识的旗标后就把剩下的
+              #   全部透传给应用，排后面会被无视（2026-10-05 实测 dump-config 不认）。
+              # ★ 文件缺失 = DSH 拒绝启动：首次部署先执行
+              #   printf '[]\\n' > gate-data/dsh-patch.yml（门禁启动时也会自愈写入）。
+              "--patch", "/gate-patch/dsh-patch.yml",
+              "--no-open", "--port", "3082",
               "--trusted-host", "${DSH_TRUSTED_HOST:-dsh.example.com}",
               "--trusted-host", "${DSH_TRUSTED_HOST:-dsh.example.com}:443"]
     logging:
@@ -62,7 +75,7 @@ services:
 
   gate:
     build: ./gate
-    image: dsh-gate:1.10.0
+    image: dsh-gate:1.11.0
     container_name: dshai-gate
     restart: unless-stopped
     network_mode: host
@@ -92,6 +105,11 @@ services:
       # 配上后登录页不再显示「DSH 令牌」框，登录时门禁自己向 DSH 换会话；
       # 留空 = 保持旧行为（手工粘贴令牌）。
       - GATE_DSH_SESSION_KEY=${GATE_DSH_SESSION_KEY:-}
+      # 1.11.0 域名设置：与 dsh --trusted-host 用同一个 .env 值，门禁拿它当
+      # 「基础域名」（恒在放行名单、后台删不掉，要改去改 .env）；
+      # GATE_DSH_PATCH 指向写给 dsh --patch 的名单文件（相对门禁自己的 /data 卷）。
+      - DSH_TRUSTED_HOST=${DSH_TRUSTED_HOST:-}
+      - GATE_DSH_PATCH=/data/dsh-patch.yml
       # 日志与后台页时间跟随本地时区。gate 镜像基于 alpine（无 zoneinfo），时区库由
       # gate/main.go 里的 `_ "time/tzdata"` 内嵌；不设 TZ 会退回 UTC，页面时间早 8 小时
       # （2026-09-27 实测：宿主 18:45:35 CST 而容器 10:45:35 UTC）。

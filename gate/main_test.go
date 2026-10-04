@@ -977,3 +977,231 @@ func TestTwoStepFirstPageSubtitle(t *testing.T) {
 		t.Errorf("单步模式副标题不该变：TwoStep=%v Subtitle=%q", v3.TwoStep, v3.Subtitle)
 	}
 }
+
+// ---------- 1.11.0 域名设置 ----------
+
+// 域名校验：合法的过、非法的全部拦（每类坏输入一个代表）。
+func TestNormalizeDomain(t *testing.T) {
+	good := map[string]string{
+		"Example.COM":     "example.com",   // 大小写归一
+		" example.com  ":  "example.com",   // 首尾空白
+		"a.example.com.":  "a.example.com", // 尾根点
+		"xn--fiqs8s.com":  "xn--fiqs8s.com",
+		"ex-ample.com:4":  "ex-ample.com:4",
+		"localhost:8080":  "localhost:8080",
+		"1.2.3.4:2299":    "1.2.3.4:2299",
+		"a-b.c-d.example": "a-b.c-d.example",
+	}
+	for in, want := range good {
+		got, err := normalizeDomain(in)
+		if err != nil || got != want {
+			t.Errorf("normalizeDomain(%q) = %q, %v；想要 %q", in, got, err, want)
+		}
+	}
+	bad := []string{
+		"", "http://a.com", "a.com/path", "a b.com", "a@b.com", "a.com?q=1",
+		"a..com", ".a.com", "-a.com", "a-.com", "a.com:", "a.com:0",
+		"a.com:65536", "a.com:xx", "中文.com", "a..", strings.Repeat("a", 254),
+		"[::1]:80", "::1",
+	}
+	for _, in := range bad {
+		if got, err := normalizeDomain(in); err == nil {
+			t.Errorf("normalizeDomain(%q) 没拦住，返回了 %q", in, got)
+		}
+	}
+}
+
+// hostAllowed：名单空=放行一切；有名单后只认名单 + 回环 + IP 字面量。
+func TestHostAllowed(t *testing.T) {
+	oldEnv, oldCfg := envDomains, cfg
+	t.Cleanup(func() { envDomains, cfg = oldEnv, oldCfg })
+
+	// 名单全空 → 不限制
+	envDomains, cfg = nil, gateConfig{}
+	for _, h := range []string{"evil.example", "anything.test:9999", ""} {
+		if !hostAllowed(h) {
+			t.Errorf("空名单时 Host=%q 应放行（防锁死）", h)
+		}
+	}
+
+	envDomains = []string{"base.example.com"}
+	cfg = gateConfig{Domains: []string{"extra.example.com", "x.example:8443"}}
+	allow := []string{
+		"base.example.com", "BASE.Example.com", "base.example.com:443",
+		"extra.example.com", "127.0.0.1:2299", "127.0.0.1", "localhost:1234",
+		"::1", "[::1]:80", "10.1.2.3", "x.example:8443",
+	}
+	for _, h := range allow {
+		if !hostAllowed(h) {
+			t.Errorf("Host=%q 应放行", h)
+		}
+	}
+	deny := []string{"evil.example", "notbase.example.com", "x.example", "x.example:9999", "sub.base.example.com"}
+	for _, h := range deny {
+		if hostAllowed(h) {
+			t.Errorf("Host=%q 应拒绝", h)
+		}
+	}
+}
+
+// DSH patch 文件内容：空名单给 []（不覆盖任何东西），有名单给官方写法的整行。
+func TestDSHPatchContent(t *testing.T) {
+	if got := dshPatchContent(nil); got != "[]\n" {
+		t.Errorf("空名单应给 []，实际 %q", got)
+	}
+	got := dshPatchContent([]string{"a.example.com", "b.example.com:443"})
+	want := `# 由 dshai-gate 后台「访问域名」自动生成，手改无效（保存即覆盖）。
+# 让 DSH 的 /api 白名单接受这些域名；改完需在后台点「重启 DSH」。
+- id: connection
+  config:
+    trustedHosts: !!js "['a.example.com', 'b.example.com:443', ...ctx.webRuntime.trustedHosts]"
+`
+	if got != want {
+		t.Errorf("patch 内容不对：\n%s\n想要：\n%s", got, want)
+	}
+	if !strings.Contains(got, "由 dshai-gate") {
+		t.Error("生成文件要带「勿手改」头注释")
+	}
+}
+
+// 后台保存：合法名单落盘 + 写 patch 文件；有一行非法则整体不改。
+func TestAdminDomainsHandler(t *testing.T) {
+	oldCfg, oldPath, oldW, oldPatch, oldEnv := cfg, cfgPath, cfgWritable, dshPatchPath, envDomains
+	t.Cleanup(func() {
+		cfg, cfgPath, cfgWritable, dshPatchPath, envDomains = oldCfg, oldPath, oldW, oldPatch, oldEnv
+		adminMsgState.mu.Lock()
+		adminMsgState.text, adminMsgState.at = "", time.Time{}
+		adminMsgState.mu.Unlock()
+	})
+	cfg = gateConfig{}
+	cfgPath = filepath.Join(t.TempDir(), "state.json")
+	cfgWritable = true
+	dshPatchPath = filepath.Join(t.TempDir(), "dsh-patch.yml")
+	envDomains = []string{"base.example.com"}
+
+	post := func(domains string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodPost, "/__gate/domains",
+			strings.NewReader(url.Values{"domains": {domains}}.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		handleDomains(w, r)
+		return w
+	}
+
+	// 合法：去空白、去重、小写化
+	if w := post("A.example.com\n a.example.com \n\nb.example.com:8443\n"); w.Code != http.StatusSeeOther {
+		t.Fatalf("合法名单应 303，实际 %d", w.Code)
+	}
+	if got := strings.Join(configSnapshot().Domains, ","); got != "a.example.com,b.example.com:8443" {
+		t.Errorf("落盘名单不对：%s", got)
+	}
+	patch, err := os.ReadFile(dshPatchPath)
+	if err != nil || !strings.Contains(string(patch), "'a.example.com', 'b.example.com:8443'") {
+		t.Errorf("patch 文件没写对：%v %s", err, patch)
+	}
+	if !strings.Contains(adminMsg(), "已保存（2 个）") {
+		t.Errorf("成功提示不对：%s", adminMsg())
+	}
+
+	// 有一行非法 → 整体不改
+	if w := post("good.example.com\nbad domain!"); w.Code != http.StatusSeeOther {
+		t.Fatalf("应 303 回后台，实际 %d", w.Code)
+	}
+	if got := strings.Join(configSnapshot().Domains, ","); got != "a.example.com,b.example.com:8443" {
+		t.Errorf("含非法行时名单不能被改，实际：%s", got)
+	}
+	if !strings.Contains(adminMsg(), "第 2 行") || !strings.Contains(adminMsg(), "没改") {
+		t.Errorf("拒绝提示要指到具体行：%s", adminMsg())
+	}
+
+	// 清空名单 → 落盘空 + patch 回到 []
+	if w := post(""); w.Code != http.StatusSeeOther {
+		t.Fatalf("清空应 303，实际 %d", w.Code)
+	}
+	if len(configSnapshot().Domains) != 0 {
+		t.Error("清空后名单应为空")
+	}
+	if p, _ := os.ReadFile(dshPatchPath); string(p) != "[]\n" {
+		t.Errorf("清空后 patch 应为 []，实际 %q", p)
+	}
+}
+
+// 后台页要渲染出域名卡：表单、textarea、生效名单徽章一个都不能少。
+func TestAdminTemplateDomainsCard(t *testing.T) {
+	oldEnv, oldCfg := envDomains, cfg
+	t.Cleanup(func() { envDomains, cfg = oldEnv, oldCfg })
+	envDomains = []string{"base.example.com"}
+	cfg = gateConfig{Domains: []string{"extra.example.com"}}
+	var b bytes.Buffer
+	if err := adminTpl.Execute(&b, adminView{
+		Title: "t", Version: "1.11.0",
+		Domains: cfg.Domains, EnvDomains: envDomains,
+		DomainsAll: effectiveDomains(cfg), DomainCount: 2, DshPatchOn: true,
+	}); err != nil {
+		t.Fatalf("模板渲染失败：%v", err)
+	}
+	page := b.String()
+	for _, want := range []string{
+		`action="/__gate/domains"`, `name="domains"`, "访问域名",
+		"base.example.com", "extra.example.com", "保存域名", "重启 DSH",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("后台页缺少 %q", want)
+		}
+	}
+}
+
+// 403 防线本体：名单外的 Host 连门都进不去（HTML 给人看、JSON 给程序看）。
+func TestWithGateRejectsUnknownHost(t *testing.T) {
+	oldEnv, oldCfg := envDomains, cfg
+	t.Cleanup(func() { envDomains, cfg = oldEnv, oldCfg })
+	envDomains = []string{"good.example.com"}
+	cfg = gateConfig{}
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	h := withGate(next)
+
+	get := func(host, accept string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil)
+		r.Host = host
+		if accept != "" {
+			r.Header.Set("Accept", accept)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+
+	// 名单外 + HTML 请求 → 403 且带指引文案
+	w := get("evil.example.com", "text/html")
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "访问域名") {
+		t.Errorf("名单外 HTML 应 403 带指引：code=%d body=%.80s", w.Code, w.Body.String())
+	}
+	// 名单外 + API 请求 → 403 JSON
+	w = get("evil.example.com", "application/json")
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "unknown host") {
+		t.Errorf("名单外 JSON 应 403：code=%d body=%s", w.Code, w.Body.String())
+	}
+	// 名单内 / 回环 / IP → 放行到 next（未登录 → 401）
+	w = get("good.example.com", "")
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("名单内 Host 应过闸（未登录 401），实际 %d", w.Code)
+	}
+	w = get("127.0.0.1:2299", "")
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("回环 Host 应过闸，实际 %d", w.Code)
+	}
+	// 名单外也不给登录页：POST /__gate/login 同样 403
+	r := httptest.NewRequest(http.MethodPost, "/__gate/login", strings.NewReader("u=x"))
+	r.Host = "evil.example.com"
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("名单外连登录 POST 都应 403，实际 %d", w.Code)
+	}
+}

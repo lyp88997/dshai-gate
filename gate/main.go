@@ -59,7 +59,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.10.0"
+	gateVersion  = "1.11.0"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 
@@ -1585,6 +1585,22 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
 </div>
 
 <div class="card">
+  <h2>访问域名（名单内的域名才放行 · 1.11.0）</h2>
+  <div class="stats">
+    <div class="stat"><b>当前放行</b><span>{{if .DomainCount}}{{range .DomainsAll}}<span class="pill">{{.}}</span>{{end}}{{else}}<span class="badge badge-info">不限制</span>{{end}}</span></div>
+    <div class="stat"><b>.env 基础域名</b><span>{{if .EnvDomains}}{{range .EnvDomains}}<span class="pill">{{.}}</span>{{end}}{{else}}没配{{end}}</span></div>
+    <div class="stat"><b>DSH 白名单</b><span>{{if .DshPatchOn}}<span class="badge badge-ok">已同步（改动后需重启 DSH）</span>{{else}}<span class="badge badge-info">未启用</span>{{end}}</span></div>
+  </div>
+  <form method="post" action="/__gate/domains" class="grid2" style="margin-top:14px">
+    <label class="wide" style="font-weight:600;margin:0">放行名单（一行一个域名；增=加一行、改=改那行、删=删那行，留空=不限制）</label>
+    <textarea name="domains" rows="4" spellcheck="false" autocapitalize="off" autocorrect="off" style="width:100%;margin-top:5px;padding:9px 11px;border-radius:10px;font:inherit;font-size:13px;font-family:ui-monospace,monospace;color:var(--fg);background:rgba(125,145,255,.10);border:1px solid var(--cardb);resize:vertical">{{range .Domains}}{{.}}
+{{end}}</textarea>
+    <div><button class="btn" type="submit">保存域名</button></div>
+    <p class="muted wide">只填裸域名（可带 <code>:端口</code>），别带 <code>http://</code> 和路径；中文域名写 punycode（<code>xn--</code> 开头）。名单外的域名一律 403 —— 这挡的是「攻击者域名解析到你服务器」的重绑攻击。<b>.env 基础域名（上面那格）永远在名单里，这里删不掉它，要改去服务器改 .env。</b>保存后门禁这层立即生效；{{if .DshPatchOn}}已同步给 DSH 的白名单，<b>点页顶「重启 DSH」后 DSH 侧才认</b>。{{end}}新域名要能打开网页，还得先在反代/证书那边把域名指到本机、（用 GitHub 登录时）把 OAuth 回调地址改成新域名 —— 那两步门禁代劳不了。</p>
+  </form>
+</div>
+
+<div class="card">
   <details id="ghsec"{{if not .GitHubConfigured}} open{{end}}>
   <summary>GitHub 登录（手动配置）— {{if .GitHubConfigured}}已配置（{{if .GitHubEnabled}}开启中{{else}}未开启{{end}}），点这一行改{{else}}还没配好，点这一行展开设置{{end}}</summary>
   <ol class="steps">
@@ -1897,6 +1913,13 @@ type adminView struct {
 	DSHOK   bool
 	DSHLeft string
 
+	// 访问域名（1.11.0）
+	Domains     []string // 后台名单（可编辑部分）
+	EnvDomains  []string // .env 的 DSH_TRUSTED_HOST（只读展示）
+	DomainsAll  []string // 生效名单 = 前两者并集，卡片顶部用
+	DomainCount int      // 生效条数（0 = 不限制）
+	DshPatchOn  bool     // 配了 GATE_DSH_PATCH = DSH 白名单同步可用
+
 	RestartBusy   bool
 	RestartAt     string
 	RestartResult string
@@ -1955,7 +1978,7 @@ func toneOf(kind, text string) string {
 		"GitHub 换票失败", "GitHub 查询账号失败", "DSH 不可达":
 		return "err"
 	case "未鉴权拦截", "锁定期间尝试", "接口缺有效 DSH 会话",
-		"踢光设备", "DSH 重启", "历史日志":
+		"踢光设备", "DSH 重启", "历史日志", "未知域名拒绝":
 		return "warn"
 	case "插件操作":
 		// 同一类里既有「更新完成」也有「被市场拒绝」，先看文案里的信号词。
@@ -2797,6 +2820,11 @@ func dshVersionRefreshNow(host, cookie string) {
 }
 
 func handleAdmin(w http.ResponseWriter, r *http.Request) {
+	// 1.11.0 自愈钩子：每次进后台都对一次 DSH 白名单文件（内容没变不落盘）。
+	// 文件被人删了也能在「点重启 DSH 之前」补回来，不会重启出一个起不来的 DSH。
+	if err := writeDSHPatch(configSnapshot()); err != nil {
+		setAdminMsg("DSH 白名单文件写入失败：%v —— 重启 DSH 前先解决它，否则 DSH 可能起不来。", err)
+	}
 	evs, total := secSnapshot()
 	rows, nBad, nWarn, nOK, nInfo := buildRows(evs)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -2875,6 +2903,9 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 		BaseURL:          externalBase(r), CallbackURL: githubCallbackURL(r),
 		StatePath: cfgPath, StateWritable: cfgWritable,
 		DSHDays: dshSessionDs, DSHOK: dshSessionFresh(r), DSHLeft: dshLeft,
+		Domains: cfg.Domains, EnvDomains: envDomains,
+		DomainsAll: effectiveDomains(cfg), DomainCount: len(effectiveDomains(cfg)),
+		DshPatchOn: dshPatchPath != "",
 		RestartBusy: busy, RestartAt: at, RestartResult: result,
 		DshUp:      dshListening(),
 		UpErrCount: upErrs, RestartCount: restarts,
@@ -2911,6 +2942,10 @@ type gateConfig struct {
 	// 非空时启动用它覆盖环境变量里的口令（1.10.0 需求：后台可改密码）。
 	// 只写口令、不动会话密钥 —— 改密码不踢人，已登录的会话继续有效。
 	PWHash string `json:"pwHash,omitempty"`
+	// Domains 是后台「访问域名」卡维护的放行名单（1.11.0）：每项一个裸域名
+	// （小写、可带 :端口），与 .env 的 DSH_TRUSTED_HOST 取并集后，
+	// 门禁只放行名单里的 Host。两者都空 = 不限制（保持旧版行为，防锁死）。
+	Domains []string `json:"domains,omitempty"`
 	// SessionEpoch 是「登录代数」：每踢一次光（/__gate/logout-all）+1，
 	// 全体旧 Cookie（含未过期的）因代数对不上当场作废。0 = 还没踢过。
 	SessionEpoch int64 `json:"sessionEpoch,omitempty"`
@@ -2921,6 +2956,10 @@ var (
 	cfgPath     string
 	cfgWritable bool
 	cfg         gateConfig
+
+	// dshPatchPath（1.11.0）：DSH --patch 文件路径，来自 GATE_DSH_PATCH；
+	// 空 = 不启用「后台改域名同步给 DSH」这半边（门禁白名单照常工作）。
+	dshPatchPath string
 )
 
 // loadConfig 读配置。文件不存在 = 全默认；读坏了 = 用默认值并大声告警。
@@ -2985,6 +3024,177 @@ func currentPWHash() string {
 		return h
 	}
 	return pwHash
+}
+
+// ---------- 访问域名白名单（1.11.0） ----------
+//
+// 名单来源两个：.env 的 DSH_TRUSTED_HOST（envDomains，启动读一次，界面上
+// 只读展示）与后台「访问域名」卡存的 cfg.Domains（可增删改）。生效名单 =
+// 两者并集；**都空 = 不限制** —— 老部署没配域名也能照常工作，不会把人锁死。
+//
+// DSH 侧另有一道 /api Host 围栏（--trusted-host），门禁在保存时把名单写成
+// 它认得的 cordis patch 文件，重启 DSH 后生效（见 writeDSHPatch）。
+
+var envDomains []string // 启动时从 DSH_TRUSTED_HOST 解析，之后只读
+
+// normalizeDomain 规范并校验一个域名条目：转小写、去首尾空白与末尾的根点；
+// 允许「裸域名或域名:端口」。返回的第二个值是给后台看的人话错误。
+//
+// 规则刻意收紧到 DSH assertTrustedAuthority 认的形态（裸 authority）：
+// 不带 http://、不带路径、不带空格、不带 @，端口 1-65535，总长 ≤253。
+// 写进 patch 文件的是单引号包起来的字面量，字符集受限 = 也堵死了注入。
+func normalizeDomain(s string) (string, error) {
+	d := strings.ToLower(strings.TrimSpace(s))
+	d = strings.TrimSuffix(d, ".")
+	if d == "" {
+		return "", fmt.Errorf("域名不能为空")
+	}
+	if strings.Contains(d, "://") || strings.ContainsAny(d, "/?#@ \\") {
+		return "", fmt.Errorf("只填裸域名（可带 :端口），别带 http://、路径、空格这些")
+	}
+	if len(d) > 253 {
+		return "", fmt.Errorf("太长了（超过 253 字符）")
+	}
+	host, port := d, ""
+	if i := strings.LastIndex(d, ":"); i >= 0 {
+		host, port = d[:i], d[i+1:]
+		if strings.Contains(host, ":") {
+			return "", fmt.Errorf("暂不支持 IPv6 字面量（IP 直连本来就放行，用不着进名单）")
+		}
+		if port == "" {
+			return "", fmt.Errorf("冒号后面没有端口")
+		}
+	}
+	if host == "" {
+		return "", fmt.Errorf("冒号前面没有域名")
+	}
+	if port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", fmt.Errorf("端口要是 1-65535 的数字")
+		}
+	}
+	for _, lbl := range strings.Split(host, ".") {
+		if lbl == "" {
+			return "", fmt.Errorf("有连续的点或首尾点")
+		}
+		if len(lbl) > 63 || lbl[0] == '-' || lbl[len(lbl)-1] == '-' {
+			return "", fmt.Errorf("「%s」不是合法的域名段", lbl)
+		}
+		for _, c := range lbl {
+			if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' {
+				continue
+			}
+			return "", fmt.Errorf("含非法字符「%c」（中文域名请写成 punycode，xn-- 开头）", c)
+		}
+	}
+	if port != "" {
+		return host + ":" + port, nil
+	}
+	return host, nil
+}
+
+// effectiveDomains 当前放行名单 = .env 基础域名 ∪ 后台名单（去重保序）。
+func effectiveDomains(c gateConfig) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(envDomains)+len(c.Domains))
+	for _, d := range append(append([]string{}, envDomains...), c.Domains...) {
+		if d != "" && !seen[d] {
+			seen[d] = true
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// hostAllowed 门禁的 Host 白名单闸门（withGate 顶上第一件事）。
+// 放行：名单为空（不限制）、回环与 localhost、任何 IP 字面量（攻击者没法用
+// IP 做 DNS 重绑，直连本来也只在内网）、名单内域名（带端口的条目连端口一起比，
+// 裸条目匹配任意端口）。其余一律拒 —— 防的就是「攻击者域名解析到你服务器」
+// 那一下（DNS rebinding），DSH 自己的 /api 围栏是第二道。
+func hostAllowed(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if hp, _, err := net.SplitHostPort(h); err == nil {
+		h = hp
+	}
+	h = strings.Trim(h, "[]")
+	if h == "" || h == "localhost" {
+		return true
+	}
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	list := effectiveDomains(configSnapshot())
+	if len(list) == 0 {
+		return true
+	}
+	raw := strings.ToLower(strings.TrimSpace(host))
+	for _, d := range list {
+		if strings.Contains(d, ":") {
+			if d == raw {
+				return true
+			}
+		} else if d == h {
+			return true
+		}
+	}
+	return false
+}
+
+// dshPatchContent 把名单渲染成 DSH 认的 cordis patch 文件内容。
+// 没有名单 → "[]"（空 patch = 什么都不覆盖，DSH 保持 --trusted-host 原样）。
+// 有名单 → 只覆盖 connection 行的 trustedHosts：字面量在前，后面拼上
+// ...ctx.webRuntime.trustedHosts（= 回环/LAN + .env 域名经 --trusted-host
+// 传进去的那份），这是 dsh-web-app/cordis.patch.yml 官方注释认可的写法：
+//
+//	A deployment adding authorities keeps this expression and concatenates
+//	its literals, for example: ['app.internal', ...ctx.webRuntime.trustedHosts]
+//
+// !!js 只能标量，整个表达式必须双引号包成一个字符串（实测 `!!js [..]`
+// 序列写法会报 unknown tag）。域名经过 normalizeDomain 校验，字符集
+// [a-z0-9.:-] = 单引号字面量天然安全，无需转义。
+func dshPatchContent(domains []string) string {
+	if len(domains) == 0 {
+		return "[]\n"
+	}
+	var b strings.Builder
+	b.WriteString("# 由 dshai-gate 后台「访问域名」自动生成，手改无效（保存即覆盖）。\n")
+	b.WriteString("# 让 DSH 的 /api 白名单接受这些域名；改完需在后台点「重启 DSH」。\n")
+	b.WriteString("- id: connection\n  config:\n    trustedHosts: !!js \"[")
+	for i, d := range domains {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("'" + d + "'")
+	}
+	b.WriteString(", ...ctx.webRuntime.trustedHosts]\"\n")
+	return b.String()
+}
+
+// writeDSHPatch 把后台名单落成 DSH 的 --patch 文件。路径来自
+// GATE_DSH_PATCH（compose 里指向 /data/dsh-patch.yml = ./gate-data/dsh-patch.yml，
+// dsh 以只读卷挂进容器）；没配就跳过（独立使用门禁的场景不受影响）。
+// 原子写（同目录 tmp + rename），0644 让 dsh 的 uid1000 读得到。
+//
+// ★ 只写 c.Domains（后台名单），不写 .env 基础域名：patch 表达式末尾的
+// ...ctx.webRuntime.trustedHosts 已经带上了 --trusted-host 传入的 .env 域名
+// 与 LAN 字面量，重复写反而让「后台清空名单」清不干净。
+func writeDSHPatch(c gateConfig) error {
+	if dshPatchPath == "" {
+		return nil
+	}
+	content := dshPatchContent(c.Domains)
+	if old, err := os.ReadFile(dshPatchPath); err == nil && string(old) == content {
+		return nil // 没变化不重写，免得每次启动都动文件
+	}
+	if err := os.MkdirAll(filepath.Dir(dshPatchPath), 0o755); err != nil {
+		return err
+	}
+	tmp := dshPatchPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dshPatchPath)
 }
 
 // modesOf 算出「按这份配置」实际可用的登录方式。
@@ -3440,6 +3650,59 @@ func handlePassword(w http.ResponseWriter, r *http.Request) {
 	backToAdmin(w, r)
 }
 
+// handleDomains 后台「访问域名」保存（1.11.0）。textarea 一行一个域名，
+// 整体替换名单（增 = 加一行、改 = 改那行、删 = 删那行，对小白最直白）。
+// 逐条校验，有一条不合法就整体不改（半改不改的名单比拒绝更害人）。
+// 保存后：门禁白名单立即生效；DSH 那半边写进 --patch 文件，提示点「重启 DSH」。
+func handleDomains(w http.ResponseWriter, r *http.Request) {
+	if !adminPost(w, r) {
+		return
+	}
+	ip := clientIP(r)
+	var list []string
+	seen := map[string]bool{}
+	for i, line := range strings.Split(r.FormValue("domains"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		d, err := normalizeDomain(line)
+		if err != nil {
+			setAdminMsg("没改：第 %d 行「%s」不合法 —— %s", i+1, line, err)
+			secNote("域名设置", ip, "被拒：第 %d 行 %q（%v）", i+1, line, err)
+			backToAdmin(w, r)
+			return
+		}
+		if !seen[d] {
+			seen[d] = true
+			list = append(list, d)
+		}
+	}
+	c := configSnapshot()
+	c.Domains = list
+	saveErr := saveConfig(c)
+	patchErr := writeDSHPatch(c)
+	eff := effectiveDomains(c)
+	switch {
+	case saveErr != nil && patchErr != nil:
+		setAdminMsg("域名名单已改（仅内存生效，两处都没落盘）：%v / DSH 白名单：%v", saveErr, patchErr)
+	case saveErr != nil:
+		setAdminMsg("域名名单已改（仅内存生效，没写进磁盘）：%v", saveErr)
+	case patchErr != nil:
+		setAdminMsg("域名名单已保存（%d 个），但 DSH 白名单文件没写成：%v —— DSH 侧将不认新域名。", len(list), patchErr)
+	case dshPatchPath != "":
+		setAdminMsg("域名名单已保存（%d 个），门禁立即生效；DSH 白名单已写入，点页顶「重启 DSH」后新域名才被 DSH 接受。", len(list))
+	default:
+		setAdminMsg("域名名单已保存（%d 个），门禁立即生效。", len(list))
+	}
+	note := ""
+	if dshPatchPath != "" {
+		note = "（DSH 白名单已更新，待重启 DSH）"
+	}
+	secNote("域名设置", ip, "名单=[%s]%s", strings.Join(eff, ", "), note)
+	backToAdmin(w, r)
+}
+
 // handleGithubSave 保存 GitHub 登录配置（后台页手填，密钥不回显）。
 func handleGithubSave(w http.ResponseWriter, r *http.Request) {
 	if !adminPost(w, r) {
@@ -3504,6 +3767,23 @@ func handleRepair(w http.ResponseWriter, r *http.Request) {
 
 func withGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 1.11.0 访问域名白名单：名单外的 Host（DNS 重绑、随便解析到本机的
+		// 攻击者域名）连登录页都不给。名单空 = 不限制；回环/IP 直连恒放行。
+		if !hostAllowed(r.Host) {
+			secNote("未知域名拒绝", clientIP(r), "Host=%q %s %s", r.Host, r.Method, r.URL.Path)
+			if wantsHTML(r) {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-store")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`<!doctype html><meta charset="utf-8"><title>403</title>` +
+					`<body style="font-family:sans-serif;text-align:center;margin-top:18vh;color:#555">` +
+					`<h1>403 · 域名不在放行名单</h1><p>这个访问域名没有在门禁的「访问域名」名单里。<p>` +
+					`<p>如果你是站主：在后台页「访问域名」卡里加上它。</p>`))
+				return
+			}
+			http.Error(w, `{"error":"unknown host"}`, http.StatusForbidden)
+			return
+		}
 		switch r.URL.Path {
 		case gatePrefix + "/login":
 			handleLogin(w, r)
@@ -3538,6 +3818,11 @@ func withGate(next http.Handler) http.Handler {
 			case gatePrefix + "/password":
 				// 后台改口令（1.10.0）：验旧口令（+动态验证码）后写状态文件
 				handlePassword(w, r)
+				return
+			case gatePrefix + "/domains":
+				// 后台改访问域名名单（1.11.0）：门禁白名单立即生效，
+				// 同时写 DSH --patch 文件（重启 DSH 后 DSH 侧生效）
+				handleDomains(w, r)
 				return
 			case gatePrefix + "/github":
 				handleGithubSave(w, r)
@@ -4008,6 +4293,30 @@ func main() {
 		log.Fatal("门禁配置错误：GATE_USERNAME 需要同时配置 GATE_PASSWORD_HASH（用户名必须配口令）")
 	}
 
+	// 访问域名（1.11.0）。DSH_TRUSTED_HOST 是 compose 传给 dsh --trusted-host
+	// 的同一个 .env 值，门禁拿它当「基础域名」：恒在放行名单、删不掉，改它去改 .env。
+	// 允许逗号/空格分隔多个；坏条目告警跳过，不因为一个笔误把门锁死。
+	for _, f := range strings.FieldsFunc(os.Getenv("DSH_TRUSTED_HOST"),
+		func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+		if f == "" {
+			continue
+		}
+		if d, err := normalizeDomain(f); err == nil {
+			envDomains = append(envDomains, d)
+		} else {
+			log.Printf("⚠️ DSH_TRUSTED_HOST 里的 %q 不是合法域名（%v），忽略", f, err)
+		}
+	}
+	// GATE_DSH_PATCH：DSH 侧 --patch 文件路径（compose 配 /data/dsh-patch.yml，
+	// dsh 以 ./gate-data/dsh-patch.yml 只读挂进自己容器）。没配 = 只用门禁白名单。
+	// 启动即把当前名单落盘 —— 文件被手删也能自愈；内容没变则不重写。
+	dshPatchPath = strings.TrimSpace(os.Getenv("GATE_DSH_PATCH"))
+	if dshPatchPath != "" {
+		if err := writeDSHPatch(cfg); err != nil {
+			log.Printf("⚠️ DSH 白名单文件写入失败（%v）—— 后台改域名不会同步给 DSH", err)
+		}
+	}
+
 	// 历史日志落盘（1.8.0）。GATE_LOG：
 	//   缺省 = 状态文件同目录 log.jsonl（跟着 GATE_STATE 走，即 /data 卷）
 	//   显式 off / 0 / false = 关闭
@@ -4060,6 +4369,10 @@ func main() {
 	}
 	upstreamURL = target
 
+	// 域名白名单记进历史（放在 histOpen 之后才落得了盘）。
+	if eff := effectiveDomains(cfg); len(eff) > 0 {
+		secNote("域名白名单", "-", "放行 [%s]（名单外的 Host 一律 403）", strings.Join(eff, ", "))
+	}
 	secNote("启动", "-", "v%s 监听 %s → %s（%s，会话=%d 天，DSH 会话=%d 天，注入=%v，时区=%s，历史落盘=%s，巡检=%s）",
 		gateVersion, listen, target, modesSummary(), sessionDs, dshSessionDs, inject, time.Local.String(), logDesc, healthDesc)
 	srv := &http.Server{

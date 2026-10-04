@@ -329,7 +329,7 @@ def main():
     try:
         wait_listen()
 
-        print("== dshai-gate e2e 测试台（1.9.0 回归 + 1.10.0 新需求）==")
+        print("== dshai-gate e2e 测试台（1.9.0/1.10.0 回归 + 1.11.0 域名设置）==")
         # ---- 未登录 ----
         st, _, _ = call("GET", "/")
         check("未登录导航 → 401", st == 401, f"实际 {st}")
@@ -515,7 +515,7 @@ def main():
         # 需求② 用户名+口令+动态验证码登录、登录页撤令牌框、自动获取 DSH 会话；
         # 需求① 插件状态「获取中」与手动检测刷新；需求③ 插件管理默认折叠；
         # 需求④ DSH 版本检测 0.2.0-rc.2 + 「缓存 10 分钟」提示。
-        print("== 1.10.0 e2e 测试台（第二实例） ==", flush=True)
+        print("== 1.11.0 e2e 测试台（第二实例） ==", flush=True)
         gate.terminate()
         try:
             gate.wait(timeout=5)
@@ -537,6 +537,10 @@ def main():
             "GATE_STATE": os.path.join(workdir, "state2.json"),
             "GATE_LOG": HIST_PATH,
             "GATE_HEALTH_INTERVAL": "0",  # 巡检第一实例已测过；第二实例只测登录/后台
+            # 1.11.0 域名设置：基础域名 = 现有测试一直在用的 Host，DSH patch
+            # 落到 workdir（门禁启动时自愈写入，此时应为 []）。
+            "DSH_TRUSTED_HOST": HOST_NAME,
+            "GATE_DSH_PATCH": os.path.join(workdir, "dsh-patch.yml"),
         })
         glog = open(os.path.join(workdir, "gate2.log"), "wb")
         gate = subprocess.Popen([binary], env=env, stdout=glog, stderr=subprocess.STDOUT)
@@ -664,6 +668,86 @@ def main():
                   lambda: any(e.get("kind") == "插件操作" for e in hist_kinds()),
                   timeout=4)
         check("手动检测刷新记进历史日志", ev is not None)
+
+        # ============ 1.11.0 域名设置（同第二实例） ============
+        patch_file = os.path.join(workdir, "dsh-patch.yml")
+
+        # ---- 启动即写 patch：空名单 → [] ----
+        def patch_ready():
+            try:
+                with open(patch_file) as f:
+                    return f.read()
+            except OSError:
+                return None
+        pc = poll("DSH patch 启动自愈", lambda: patch_ready() if patch_ready() == "[]\n" else None,
+                  timeout=4)
+        check("启动即写 DSH patch（空名单=[]）", pc is not None, str(pc))
+
+        # ---- Host 白名单闸门 ----
+        st, _, body = call("GET", "/__gate/login",
+                           headers={"Accept": "text/html"}, host="evil.example")
+        check("名单外 Host → 403 HTML 给指引",
+              st == 403 and "访问域名" in body.decode("utf-8", "replace"), f"status={st}")
+        st, _, body = call("GET", "/__gate/admin", host="evil.example")
+        check("名单外 Host → 403 JSON",
+              st == 403 and b"unknown host" in body, f"status={st}")
+        st, _, _ = call("GET", "/__gate/login",
+                        headers={"Accept": "text/html"}, host="127.0.0.1:%d" % GATE_PORT)
+        check("回环 Host 恒放行", st == 200, f"status={st}")
+        st, _, _ = call("GET", "/__gate/login",
+                        headers={"Accept": "text/html"}, host=HOST_NAME)
+        check("基础域名（.env）放行", st == 200, f"status={st}")
+
+        # ---- 后台加域名：门禁立即生效 + patch 同步 ----
+        f = urlencode({"domains": "api.example.com\nweb.example.com"})
+        st, _, _ = call("POST", "/__gate/domains", cookie=n2 or "",
+                        body=f, headers=CT)
+        check("保存域名 → 303 回后台", st == 303, f"status={st}")
+        with open(os.path.join(workdir, "state2.json")) as fh:
+            saved = json.load(fh).get("domains", [])
+        check("域名落盘 state.json",
+              saved == ["api.example.com", "web.example.com"], str(saved))
+        pc = poll("DSH patch 含新域名",
+                  lambda: (lambda x: x if x and "api.example.com" in x else None)(patch_ready()),
+                  timeout=4)
+        check("DSH patch 写入字面量 + spread",
+              pc is not None and "...ctx.webRuntime.trustedHosts]" in pc
+              and "'api.example.com'" in pc, str(pc))
+        st, _, _ = call("GET", "/__gate/login",
+                        headers={"Accept": "text/html"}, host="api.example.com")
+        check("新域名保存后门禁立即放行", st == 200, f"status={st}")
+        p5 = admin2()
+        check("后台页域名卡显示生效名单",
+              "api.example.com" in p5 and 'action="/__gate/domains"' in p5, "")
+
+        # ---- 非法行 → 整体不改 ----
+        f = urlencode({"domains": "good.example.com\nbad domain!"})
+        st, _, _ = call("POST", "/__gate/domains", cookie=n2 or "",
+                        body=f, headers=CT)
+        p5 = admin2()
+        check("非法域名行 → 拒且指到行",
+              st == 303 and "没改" in p5 and "第 2 行" in p5, f"status={st}")
+        with open(os.path.join(workdir, "state2.json")) as fh:
+            saved = json.load(fh).get("domains", [])
+        check("非法行未污染名单",
+              saved == ["api.example.com", "web.example.com"], str(saved))
+        st, _, _ = call("GET", "/__gate/login",
+                        headers={"Accept": "text/html"}, host="good.example.com")
+        check("被拒的行没进放行名单", st == 403, f"status={st}")
+
+        # ---- 清空名单 → patch 回到 []，但 .env 域名仍放行 ----
+        st, _, _ = call("POST", "/__gate/domains", cookie=n2 or "",
+                        body=urlencode({"domains": ""}), headers=CT)
+        pc = poll("清空后 patch 归零",
+                  lambda: (lambda x: x if x == "[]\n" else None)(patch_ready()),
+                  timeout=4)
+        check("清空名单 → patch 回到 []", pc is not None, str(pc))
+        st, _, _ = call("GET", "/__gate/login",
+                        headers={"Accept": "text/html"}, host="api.example.com")
+        check("清空后原域名回到 403", st == 403, f"status={st}")
+        st, _, _ = call("GET", "/__gate/login",
+                        headers={"Accept": "text/html"}, host=HOST_NAME)
+        check("清空后 .env 基础域名仍放行", st == 200, f"status={st}")
 
     finally:
         gate.terminate()
