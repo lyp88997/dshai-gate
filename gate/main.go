@@ -59,7 +59,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.11.0"
+	gateVersion  = "1.12.0"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 
@@ -148,10 +148,9 @@ var (
 	githubAPIBase   string
 
 	// GATE_USERNAME（1.9.0）：设置后登录多一个用户名维度（用户名+口令+动态验证码）。
-	// 必须与 GATE_PASSWORD_HASH 同时配置，启动时校验。gateUserHash 是常量时间比对用的
-	// 摘要，避免每次比对裸字符串。
-	gateUser     string
-	gateUserHash string
+	// 必须与 GATE_PASSWORD_HASH 同时配置，启动时校验。gateUser 只是「环境变量层」，
+	// 实际生效用户名走 currentUsername()：后台改过的（状态文件 Username）优先。
+	gateUser string
 
 	// dshAutoKey（1.9.0）：DSH browser-session 签名密钥（GATE_DSH_SESSION_KEY，
 	// 即 .credentials.yaml 里 client-connection/browser-session 的 32 字节 base64url secret）。
@@ -336,15 +335,31 @@ func humanDur(d time.Duration) string {
 
 // ---------- TOTP（RFC 6238：SHA1 / 30s / 6 位） ----------
 
-func totpAt(counter uint64) string {
+// totpAtS 纯函数版：给定密钥算某时间片的验证码。
+func totpAtS(counter uint64, key []byte) string {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], counter)
-	m := hmac.New(sha1.New, totpSecret)
+	m := hmac.New(sha1.New, key)
 	m.Write(buf[:])
 	sum := m.Sum(nil)
 	off := sum[len(sum)-1] & 0x0f
 	bin := (uint32(sum[off])&0x7f)<<24 | uint32(sum[off+1])<<16 | uint32(sum[off+2])<<8 | uint32(sum[off+3])
 	return fmt.Sprintf("%06d", bin%1000000)
+}
+
+// totpAt 兼容入口：按环境变量密钥算（测试与旧调用还在用）。
+func totpAt(counter uint64) string { return totpAtS(counter, totpSecret) }
+
+// currentTOTPSecret 当前生效的动态口令密钥：后台生成/保存的（状态文件）优先，
+// 其次环境变量 GATE_TOTP_SECRET。后台改密钥不用重启，每次现取（配置读锁）。
+func currentTOTPSecret() []byte {
+	if s := strings.TrimSpace(configSnapshot().TOTPSecret); s != "" {
+		if b, err := base32.StdEncoding.WithPadding(base32.NoPadding).
+			DecodeString(strings.ToUpper(s)); err == nil && len(b) >= 10 {
+			return b
+		}
+	}
+	return totpSecret
 }
 
 // verifyTOTP 返回该验证码所属的时间片；成功时同时做防重放
@@ -353,13 +368,17 @@ func verifyTOTP(input, ip string) (uint64, bool) {
 	if len(c) != totpDigits {
 		return 0, false
 	}
+	key := currentTOTPSecret()
+	if len(key) < 10 {
+		return 0, false
+	}
 	now := int64(time.Now().Unix() / totpPeriod)
 	for _, d := range []int64{0, -1, 1} {
 		if now+d < 0 {
 			continue
 		}
 		ct := uint64(now + d)
-		if subtle.ConstantTimeCompare([]byte(totpAt(ct)), []byte(c)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(totpAtS(ct, key)), []byte(c)) != 1 {
 			continue
 		}
 		replayMu.Lock()
@@ -1113,14 +1132,14 @@ func subtitleOf() string {
 	pw, totp, _ := loginModes()
 	switch {
 	case pw && totp:
-		if gateUser != "" {
+		if currentUsername() != "" {
 			return "需要用户名 + 口令 + 动态验证码"
 		}
 		return "需要口令 + 动态验证码"
 	case totp:
 		return "需要动态验证码"
 	case pw:
-		if gateUser != "" {
+		if currentUsername() != "" {
 			return "需要用户名 + 口令"
 		}
 		return "需要访问口令"
@@ -1138,7 +1157,7 @@ func tipOf() string {
 		return "受动态验证码保护 · 仅限本人使用"
 	}
 	if pw {
-		if gateUser != "" {
+		if currentUsername() != "" {
 			return "受用户名与口令保护 · 仅限本人使用"
 		}
 		return "受口令保护 · 仅限本人使用"
@@ -1155,7 +1174,7 @@ func newLoginView(errMsg string, locked bool, remain time.Duration, next string,
 		Next: sanitizeNext(next), Error: errMsg, Locked: locked,
 		Remain: humanDur(remain), NeedPassword: pw, NeedTOTP: totp, HasGitHub: gh,
 		HasSession: hasSession, TokenNeeded: !hasSession && !auto, AutoPair: auto,
-		NeedUsername: gateUser != "",
+		NeedUsername: currentUsername() != "",
 		TwoStep:      pw && totp, // 需求④：口令 + 动态验证码 → 拆两步登录
 	}
 	// 需求⑤（UI 检查优化）：两步登录的第 1 步也点明步骤，和第 2 步的
@@ -1311,17 +1330,18 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if needPw && !step2OK {
-		// 需求②：配了 GATE_USERNAME 就先验用户名；两项合成一句提示，不透露错在哪一项
-		if gateUser != "" {
+		// 需求②：配了用户名（.env 或后台改的，1.12.0）就先验它；
+		// 两项合成一句提示，不透露错在哪一项。
+		if u := currentUsername(); u != "" {
 			gotUser := hashPassword("u:" + r.FormValue("username"))
-			if subtle.ConstantTimeCompare([]byte(gotUser), []byte(gateUserHash)) != 1 {
+			if subtle.ConstantTimeCompare([]byte(gotUser), []byte(hashPassword("u:"+u))) != 1 {
 				fail("用户名或口令不正确")
 				return
 			}
 		}
 		got := hashPassword(r.FormValue("password"))
 		if subtle.ConstantTimeCompare([]byte(got), []byte(currentPWHash())) != 1 {
-			if gateUser != "" {
+			if currentUsername() != "" {
 				fail("用户名或口令不正确")
 			} else {
 				fail("口令不正确")
@@ -1478,6 +1498,27 @@ table.filter-bad tr[data-tone=ok],table.filter-bad tr[data-tone=info]{display:no
 .stat span{font-size:13.5px;word-break:break-word}
 .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;margin:2px 4px 2px 0;
   color:var(--warn);background:rgba(255,181,71,.14);border:1px solid rgba(255,181,71,.3)}
+/* 访问域名卡（1.11.0）：标签墙 + 回车添加 + 一行一个的原始框 */
+.dlabel{color:var(--muted);font-size:12px;font-weight:600;margin-bottom:8px}
+.dchips{display:flex;flex-wrap:wrap;gap:7px;min-height:34px;padding:7px 9px;border-radius:11px;
+  background:rgba(125,145,255,.07);border:1px solid var(--cardb)}
+.dchip{display:inline-flex;align-items:center;gap:7px;padding:4px 6px 4px 11px;border-radius:999px;
+  font-size:12.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg);
+  background:rgba(125,145,255,.16);border:1px solid rgba(125,145,255,.35)}
+.dchip-lock{color:var(--warn);background:rgba(255,181,71,.12);border-color:rgba(255,181,71,.35);
+  padding-right:11px;cursor:default}
+.dchip-x{width:18px;height:18px;line-height:16px;padding:0;border-radius:50%;border:none;cursor:pointer;
+  font-size:13px;color:var(--muted);background:rgba(125,145,255,.25)}
+.dchip-x:hover{color:#fff;background:var(--err)}
+.chipbar{display:flex;gap:9px;margin-top:9px}
+.chipbar input{flex:1}
+.chiprow{margin-top:11px}
+#domainta{width:100%;margin-top:9px;padding:9px 11px;border-radius:10px;font-size:13px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg);
+  background:rgba(125,145,255,.10);border:1px solid var(--cardb);resize:vertical;min-height:56px;
+  /* Chrome 给 textarea 的竖滚动条会占掉 17px，导致多出一条永远用不上的横滚动条；
+     内容是 pre-wrap 自动换行的域名行，横向不需要滚 */
+  overflow-x:hidden}
 .tablewrap{overflow-x:auto;margin:0 -4px}
 table{width:100%;border-collapse:collapse;font-size:13px;min-width:620px}
 th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--cardb);vertical-align:top}
@@ -1499,7 +1540,8 @@ details{border-radius:12px}
 summary{cursor:pointer;font-size:12.5px;color:var(--muted);font-weight:600;letter-spacing:.4px;
   list-style:none;display:flex;align-items:center;gap:8px}
 summary::-webkit-details-marker{display:none}
-summary::before{content:"▸";font-size:12px;transition:transform .15s}
+summary::before{content:"";width:0;height:0;border:4px solid transparent;border-left:6px solid currentColor;
+  transition:transform .15s;flex:none}
 details[open] summary::before{transform:rotate(90deg)}
 details[open] summary{margin-bottom:12px}
 .steps{margin:0 0 14px;padding-left:20px;color:var(--muted);font-size:12.5px;line-height:1.75}
@@ -1563,42 +1605,138 @@ input:focus{outline:none;border-color:var(--accent);background:rgba(125,145,255,
 </div>
 
 <div class="card">
-  <h2>登录方式（至少保留一种；关闭动态密码前必须先配好 GitHub 登录）</h2>
+  <h2>账号（用户名与口令 · 1.12.0）</h2>
   <div class="stats">
-    <div class="stat"><b>动态验证码</b><span>{{if not .TOTPConfigured}}<span class="badge badge-info">未配置密钥</span>{{else if .TOTPOn}}<span class="badge badge-ok">开启</span>{{else}}<span class="badge badge-info">已关闭</span>{{end}}</span></div>
+    <div class="stat"><b>用户名</b><span><span class="pill">{{.Username}}</span>{{if .DefaultCreds}} <span class="badge badge-warn">默认账号 admin/admin，请立刻改掉</span>{{end}}</span></div>
+    <div class="stat"><b>动态口令</b><span>{{if not .TOTPConfigured}}<span class="badge badge-info">未配置密钥</span>{{else if .TOTPOn}}<span class="badge badge-ok">开启（登录两步）</span>{{else}}<span class="badge badge-warn">已生成，未开启</span>{{end}}</span></div>
     <div class="stat"><b>GitHub 登录</b><span>{{if .GitHubReady}}<span class="badge badge-ok">开启</span>{{else if .GitHubEnabled}}<span class="badge badge-warn">已勾开启但配置不全</span>{{else}}<span class="badge badge-info">未开启</span>{{end}}</span></div>
-    <div class="stat"><b>访问口令</b><span>{{if .PwOn}}<span class="badge badge-ok">开启</span>{{else}}<span class="badge badge-info">未配置</span>{{end}}</span></div>
+    <div class="stat"><b>访问口令</b><span>{{if .PwOn}}<span class="badge badge-ok">已设置</span>{{else}}<span class="badge badge-info">未配置</span>{{end}}</span></div>
   </div>
-  {{if .TOTPConfigured}}<form method="post" action="/__gate/methods" class="restartbar">
-    <button class="btn ghost" type="submit" name="totp" value="{{if .TOTPOn}}off{{else}}on{{end}}">{{if .TOTPOn}}关闭动态验证码登录{{else}}开启动态验证码登录{{end}}</button>
-    <span class="muted">改完立即生效，不用重启。密钥由服务器上的 <code>scripts/set-totp.sh</code> 生成，换密钥才会让现有验证码失效。</span>
-  </form>{{else}}<p class="muted">还没配动态验证码。服务器上执行 <code>bash /opt/dshai/scripts/set-totp.sh</code> 生成密钥即可。</p>{{end}}
-  {{if .PwOn}}<form method="post" action="/__gate/password" class="grid2" style="margin-top:14px">
-    <label class="wide" style="font-weight:600;margin:0">修改登录口令（不用登服务器改 .env，改完下次登录生效）</label>
+  {{if .PwOn}}
+  <form method="post" action="/__gate/username" class="grid2" style="margin-top:14px">
+    <label class="wide" style="font-weight:600;margin:0">修改用户名（不用登服务器改 .env，改完下次登录生效）</label>
+    <label>原用户名<input name="old" value="{{.Username}}" autocomplete="username" spellcheck="false" required></label>
+    <label>新用户名<input name="newuser" autocomplete="off" spellcheck="false" maxlength="64" placeholder="想换成的用户名" required></label>
+    <label>动态验证码<input name="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="{{if .TOTPOn}}开着动态口令时必填{{else}}动态口令未开启，不用填{{end}}"{{if not .TOTPOn}} disabled{{end}}></label>
+    <div><button class="btn" type="submit">修改用户名</button></div>
+    <p class="muted wide">验原用户名 +（开着动态口令时）一码才肯改；只改用户名、不动会话密钥：已登录的设备不受影响，下次登录开始用新用户名。{{if .DefaultCreds}}<b>你还在用默认账号，改完这页会撤掉黄标。</b>{{end}}</p>
+  </form>
+  <form method="post" action="/__gate/password" class="grid2" style="margin-top:14px">
+    <label class="wide" style="font-weight:600;margin:0">修改登录口令（改完下次登录生效）</label>
     <label>原口令<input name="old" type="password" autocomplete="current-password" required></label>
     <label>新口令<input name="new" type="password" autocomplete="new-password" required></label>
     <label>再输一遍新口令<input name="confirm" type="password" autocomplete="new-password" required></label>
-    <label>动态验证码<input name="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="{{if .TOTPOn}}开着动态验证码时必填{{else}}动态验证码未开启，不用填{{end}}"{{if not .TOTPOn}} disabled{{end}}></label>
+    <label>动态验证码<input name="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="{{if .TOTPOn}}开着动态口令时必填{{else}}动态口令未开启，不用填{{end}}"{{if not .TOTPOn}} disabled{{end}}></label>
     <div><button class="btn" type="submit">修改口令</button></div>
     <p class="muted wide">只改口令、不动会话密钥：已登录的设备不受影响，下次登录开始用新口令。{{if not .StateWritable}}<b>警告：配置目录不可写，这里改的东西重启后会丢。</b>{{end}}</p>
-  </form>{{end}}
+  </form>
+  {{else}}<p class="muted">没配口令登录，改不了用户名；首次安装的默认账号 admin/admin 已可用，登录后回这里改。</p>{{end}}
+</div>
+
+<div class="card">
+  <h2>动态口令（验证器 App 的 6 位码 · 1.12.0，默认关闭）</h2>
+  <div class="stats">
+    <div class="stat"><b>状态</b><span>{{if not .TOTPConfigured}}<span class="badge badge-info">未配置</span>{{else if .TOTPOn}}<span class="badge badge-ok">开启 · 登录 = 口令 → 动态口令 两步</span>{{else}}<span class="badge badge-warn">密钥已生成，未开启</span>{{end}}</span></div>
+    <div class="stat"><b>作用</b><span>口令泄露了别人也进不来（验证码 30 秒一换）</span></div>
+  </div>
+  {{if not .TOTPConfigured}}
+  <ol class="steps">
+    <li>点「生成密钥并开始引导」——门禁现场生成一串密钥（此前若有旧密钥会作废）。</li>
+    <li>手机装验证器 App（Google Authenticator、Microsoft Authenticator、1Password 等都行），新建条目 → 手动输入。</li>
+    <li>把下面给出的密钥粘进去保存；App 从此每 30 秒换一个 6 位码。</li>
+    <li>把最新的 6 位码填进「验证码」点「验证并开启」——<b>验证码对得上才算开启</b>，之后下次登录就变成两步。</li>
+  </ol>
+  <form method="post" action="/__gate/methods" class="restartbar">
+    <button class="btn" type="submit" name="step" value="gen">生成密钥并开始引导</button>
+    <span class="muted">生成后页面会展开密钥和验证框，绑好、验过码再走。</span>
+  </form>
+  {{else if .TOTPOn}}
+  <form method="post" action="/__gate/methods" class="restartbar">
+    <button class="btn danger" type="submit" name="step" value="off">关闭动态口令（登录不再要验证码）</button>
+    <span class="muted">关了就只剩口令这一道，口令泄露谁都能进；密钥留着，想再开回这张卡点「验证并开启」。</span>
+  </form>
+  <form method="post" action="/__gate/methods" class="restartbar" style="margin-top:8px">
+    <button class="btn ghost" type="submit" name="step" value="gen">重新生成密钥</button>
+    <span class="muted">会<b>同时把动态口令停用</b>，已绑定的验证器失效；新密钥绑好、验过码后重新开启。</span>
+  </form>
+  {{else}}
+  <div class="grid2">
+    <label class="wide" style="font-weight:600;margin:0">当前密钥（验证器里「手动输入」粘这一串）</label>
+    <input readonly value="{{.TOTPKey}}" onclick="this.select()" spellcheck="false" style="font-family:ui-monospace,monospace;letter-spacing:1.5px;font-weight:600">
+  </div>
+  <details style="margin-top:8px"><summary class="muted" style="cursor:pointer">用 otpauth 链接导入（部分验证器支持扫码/链接方式）</summary>
+    <p class="muted" style="word-break:break-all;margin-top:6px">{{.TOTPUri}}</p>
+  </details>
+  <form method="post" action="/__gate/methods" class="grid2" style="margin-top:14px">
+    <label class="wide" style="font-weight:600;margin:0">填验证器上最新的 6 位码，点「验证并开启」</label>
+    <label>验证码<input name="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6 位数字，30 秒一换" required autofocus></label>
+    <div><button class="btn" type="submit" name="step" value="on">验证并开启</button></div>
+    <p class="muted wide">验证码对不上不开：防的是「生成了密钥却没人绑成功」的半吊子状态。码 30 秒一换、用过即作废，拿最新的填。</p>
+  </form>
+  <form method="post" action="/__gate/methods" class="restartbar" style="margin-top:8px">
+    <button class="btn ghost" type="submit" name="step" value="gen">重新生成密钥（换一把，旧的作废）</button>
+    <span class="muted">绑错了验证器就重新生成，再走一遍引导。</span>
+  </form>
+  {{end}}
 </div>
 
 <div class="card">
   <h2>访问域名（名单内的域名才放行 · 1.11.0）</h2>
   <div class="stats">
-    <div class="stat"><b>当前放行</b><span>{{if .DomainCount}}{{range .DomainsAll}}<span class="pill">{{.}}</span>{{end}}{{else}}<span class="badge badge-info">不限制</span>{{end}}</span></div>
-    <div class="stat"><b>.env 基础域名</b><span>{{if .EnvDomains}}{{range .EnvDomains}}<span class="pill">{{.}}</span>{{end}}{{else}}没配{{end}}</span></div>
+    <div class="stat"><b>当前放行</b><span>{{if .DomainCount}}<span class="badge badge-ok">{{.DomainCount}} 个</span>{{else}}<span class="badge badge-info">不限制</span>{{end}}</span></div>
+    <div class="stat"><b>.env 基础域名</b><span>{{if .EnvDomains}}已锁定{{else}}没配{{end}}</span></div>
     <div class="stat"><b>DSH 白名单</b><span>{{if .DshPatchOn}}<span class="badge badge-ok">已同步（改动后需重启 DSH）</span>{{else}}<span class="badge badge-info">未启用</span>{{end}}</span></div>
   </div>
-  <form method="post" action="/__gate/domains" class="grid2" style="margin-top:14px">
-    <label class="wide" style="font-weight:600;margin:0">放行名单（一行一个域名；增=加一行、改=改那行、删=删那行，留空=不限制）</label>
-    <textarea name="domains" rows="4" spellcheck="false" autocapitalize="off" autocorrect="off" style="width:100%;margin-top:5px;padding:9px 11px;border-radius:10px;font:inherit;font-size:13px;font-family:ui-monospace,monospace;color:var(--fg);background:rgba(125,145,255,.10);border:1px solid var(--cardb);resize:vertical">{{range .Domains}}{{.}}
+  <form method="post" action="/__gate/domains" id="domform" style="margin-top:14px">
+    <div class="dlabel">放行名单（点 × 删掉一个；输入框回车加进去；也可以在下面的框里一行一个直接粘贴）</div>
+    <div class="dchips" id="dchips">
+      {{range .EnvDomains}}<span class="dchip dchip-lock" title=".env 里的 DSH_TRUSTED_HOST，这里删不掉，要改去服务器 .env">.env·{{.}}</span>{{end}}
+      {{range .Domains}}<span class="dchip" data-domain="{{.}}"><span class="dchip-t">{{.}}</span><button class="dchip-x" type="button" aria-label="删除 {{.}}">×</button></span>{{end}}
+    </div>
+    <div class="chipbar">
+      <input id="chipin" type="text" placeholder="输入域名后回车添加，例如 api.example.com（可带 :端口）" spellcheck="false" autocapitalize="off" autocorrect="off">
+      <button class="btn ghost" id="chipadd" type="button">加进去</button>
+    </div>
+    <textarea name="domains" id="domainta" rows="3" spellcheck="false" autocapitalize="off" autocorrect="off">{{range .Domains}}{{.}}
 {{end}}</textarea>
-    <div><button class="btn" type="submit">保存域名</button></div>
-    <p class="muted wide">只填裸域名（可带 <code>:端口</code>），别带 <code>http://</code> 和路径；中文域名写 punycode（<code>xn--</code> 开头）。名单外的域名一律 403 —— 这挡的是「攻击者域名解析到你服务器」的重绑攻击。<b>.env 基础域名（上面那格）永远在名单里，这里删不掉它，要改去服务器改 .env。</b>保存后门禁这层立即生效；{{if .DshPatchOn}}已同步给 DSH 的白名单，<b>点页顶「重启 DSH」后 DSH 侧才认</b>。{{end}}新域名要能打开网页，还得先在反代/证书那边把域名指到本机、（用 GitHub 登录时）把 OAuth 回调地址改成新域名 —— 那两步门禁代劳不了。</p>
+    <div class="chiprow"><button class="btn" type="submit">保存域名</button></div>
+    <p class="muted" id="domainhint">只填裸域名（可带 <code>:端口</code>），别带 <code>http://</code> 和路径；中文域名写 punycode（<code>xn--</code> 开头）。名单外的域名一律 403 —— 这挡的是「攻击者域名解析到你服务器」的重绑攻击。<b>.env 基础域名（.env· 开头的那些）永远在名单里，这里删不掉它，要改去服务器改 .env。</b>保存后门禁这层立即生效；{{if .DshPatchOn}}已同步给 DSH 的白名单，<b>点页顶「重启 DSH」后 DSH 侧才认</b>。{{end}}新域名要能打开网页，还得先在反代/证书那边把域名指到本机、（用 GitHub 登录时）把 OAuth 回调地址改成新域名 —— 那两步门禁代劳不了。</p>
   </form>
 </div>
+<script>
+(function(){
+  var ta=document.getElementById('domainta');if(!ta)return;
+  var box=document.getElementById('dchips');
+  function lines(){return ta.value.split('\n').map(function(s){return s.trim()}).filter(Boolean)}
+  function esc(s){var d=document.createElement('span');d.textContent=s;return d.innerHTML}
+  function renderChips(){
+    var keep=box.querySelectorAll('.dchip-lock'),ds=lines();
+    box.innerHTML='';
+    keep.forEach(function(n){box.appendChild(n)});
+    ds.forEach(function(d){
+      var sp=document.createElement('span');sp.className='dchip';sp.setAttribute('data-domain',d);
+      sp.innerHTML='<span class="dchip-t">'+esc(d)+'</span><button class="dchip-x" type="button" aria-label="删除 '+esc(d)+'">×</button>';
+      box.appendChild(sp);
+    });
+  }
+  ta.addEventListener('input',renderChips);
+  box.addEventListener('click',function(e){
+    var x=e.target.closest('.dchip-x');if(!x)return;
+    var chip=x.closest('.dchip'),d=chip.getAttribute('data-domain');
+    ta.value=lines().filter(function(s){return s!==d}).join('\n');
+    renderChips();
+  });
+  var input=document.getElementById('chipin');
+  function add(){
+    var v=(input.value||'').trim();if(!v)return;
+    var ds=lines();if(ds.indexOf(v)<0)ds.push(v);
+    ta.value=ds.join('\n');input.value='';renderChips();input.focus();
+  }
+  document.getElementById('chipadd').addEventListener('click',add);
+  input.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();add()}});
+  document.getElementById('domform').addEventListener('submit',function(){renderChips()});
+})();
+</script>
 
 <div class="card">
   <details id="ghsec"{{if not .GitHubConfigured}} open{{end}}>
@@ -1895,6 +2033,12 @@ type adminView struct {
 	TOTPConfigured bool
 	TOTPOn         bool
 	PwOn           bool
+
+	// 账号（1.12.0）：用户名层 + 首装默认账号黄标 + 动态口令引导素材
+	Username    string // 当前生效用户名（状态文件优先，回退 GATE_USERNAME）
+	DefaultCreds bool  // 还在用 admin/admin —— 后台挂「立即修改」黄标
+	TOTPKey     string // 当前密钥 base32（未配置 = 空），引导页展示
+	TOTPUri     string // otpauth:// 导入链接（部分验证器支持），details 里给
 
 	// GitHub 登录
 	GitHubEnabled    bool
@@ -2894,7 +3038,9 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 		OutBurst: outBurst, OutWindow: int(outWindowLen / time.Second),
 		Delay: globalDelay().String(), Max: secLogMax,
 		Locks: lockedSnapshot(), Events: rows, Msg: adminMsg(),
-		TOTPConfigured: needTotp, TOTPOn: totp, PwOn: pw,
+		TOTPConfigured: totpSecretSet(cfg), TOTPOn: totp, PwOn: pw,
+		Username: currentUsername(), DefaultCreds: defaultCreds(),
+		TOTPKey: totpKeyB32(), TOTPUri: totpURI(currentUsername()),
 		GitHubEnabled: cfg.GitHub.Enabled, GitHubReady: gh,
 		GitHubClientID:   cfg.GitHub.ClientID,
 		GitHubAllow:      strings.Join(cfg.GitHub.Allow, ", "),
@@ -2937,11 +3083,17 @@ type githubConfig struct {
 // TOTPEnabled 用指针：要区分「从来没设置过」（按环境变量决定）与「后台明确关掉了」。
 type gateConfig struct {
 	TOTPEnabled *bool        `json:"totpEnabled,omitempty"`
-	GitHub      githubConfig `json:"github"`
+	// TOTPSecret 后台生成/保存的动态口令密钥（base32、无 padding，1.12.0）。
+	// 非空时优先于环境变量 GATE_TOTP_SECRET —— 不配 .env 也能在后台完成
+	// 「生成密钥 → 绑定 → 验证开启」全流程。
+	TOTPSecret string       `json:"totpSecret,omitempty"`
+	GitHub     githubConfig `json:"github"`
 	// PWHash 是后台改过的口令哈希（64 位 hex，同 GATE_PASSWORD_HASH 格式）。
 	// 非空时启动用它覆盖环境变量里的口令（1.10.0 需求：后台可改密码）。
 	// 只写口令、不动会话密钥 —— 改密码不踢人，已登录的会话继续有效。
 	PWHash string `json:"pwHash,omitempty"`
+	// Username 是后台改过的用户名（1.12.0）：非空时优先于 GATE_USERNAME。
+	Username string `json:"username,omitempty"`
 	// Domains 是后台「访问域名」卡维护的放行名单（1.11.0）：每项一个裸域名
 	// （小写、可带 :端口），与 .env 的 DSH_TRUSTED_HOST 取并集后，
 	// 门禁只放行名单里的 Host。两者都空 = 不限制（保持旧版行为，防锁死）。
@@ -3024,6 +3176,76 @@ func currentPWHash() string {
 		return h
 	}
 	return pwHash
+}
+
+// currentUsername 当前生效的用户名：后台改过的（状态文件 Username，1.12.0）优先，
+// 其次环境变量 GATE_USERNAME；都没有 = 不启用用户名（登录只问口令）。
+// 每次现取，改用户名不用重启。
+func currentUsername() string {
+	if u := strings.TrimSpace(configSnapshot().Username); u != "" {
+		return u
+	}
+	return gateUser
+}
+
+// defaultCreds 是否还在用默认账号 admin/admin（首次安装落的，或手动配成了同一对）。
+// 后台页据此挂「请立即修改」的黄标。
+func defaultCreds() bool {
+	return currentUsername() == "admin" && currentPWHash() == hashPassword("admin")
+}
+
+// githubConfigured 有没有配过 GitHub 登录的任何痕迹（开着、填过一项都算），
+// 用来判断「是不是全新安装」。
+func githubConfigured(c gateConfig) bool {
+	g := c.GitHub
+	return g.Enabled || g.ClientID != "" || g.ClientSecret != "" || len(g.Allow) > 0
+}
+
+// bootstrapFirstInstall 首次安装默认账号（1.12.0）：什么登录配置都没有时
+// （没口令、没用户名、没动态口令、没 GitHub），落一份 admin/admin 并显式记录
+// 动态口令关闭 —— 装完开箱能登录，登录后到后台改。有任何一项已配置就不是
+// 首次安装，原样不动。返回 true = 已启用默认账号（调用方打日志）。
+// ★ 先改内存配置再落盘（saveConfig 内部先把 cfg 换掉再写文件）：
+// 配置目录不可写时本次运行仍用 admin/admin，重启后按同一逻辑再落一次。
+func bootstrapFirstInstall() bool {
+	if needPw || needTotp || gateUser != "" {
+		return false // 环境变量层已经配了登录，不是首次安装
+	}
+	c := configSnapshot()
+	if c.PWHash != "" || c.Username != "" || c.TOTPSecret != "" || githubConfigured(c) {
+		return false // 状态文件里已有配置，不是首次安装
+	}
+	c.Username, c.PWHash = "admin", hashPassword("admin")
+	off := false
+	c.TOTPEnabled = &off // 动态口令默认关闭（后台可选开启）
+	needPw = true        // 口令登录从此可用（modesOf 的 pw 走这个全局）
+	if err := saveConfig(c); err != nil {
+		log.Printf("⚠️ 默认账号 admin/admin 没写进配置文件（%v）：本次运行内存里生效，改口令/用户名前先解决它", err)
+	}
+	return true
+}
+
+// totpKeyB32 当前生效密钥的 base32 展示串（没密钥返回空），给后台引导页用。
+func totpKeyB32() string {
+	k := currentTOTPSecret()
+	if len(k) < 10 {
+		return ""
+	}
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(k)
+}
+
+// totpURI otpauth 导入链接：部分验证器 App 支持从链接导入，作为扫码/手动之外的补充。
+func totpURI(user string) string {
+	key := totpKeyB32()
+	if key == "" {
+		return ""
+	}
+	if user == "" {
+		user = "admin"
+	}
+	issuer := "DSH门禁"
+	return "otpauth://totp/" + url.PathEscape(issuer+":"+user) +
+		"?secret=" + key + "&issuer=" + url.QueryEscape(issuer)
 }
 
 // ---------- 访问域名白名单（1.11.0） ----------
@@ -3200,10 +3422,18 @@ func writeDSHPatch(c gateConfig) error {
 // modesOf 算出「按这份配置」实际可用的登录方式。
 func modesOf(c gateConfig) (pw, totp, gh bool) {
 	pw = needPw
-	totp = needTotp && (c.TOTPEnabled == nil || *c.TOTPEnabled)
+	// 1.12.0：动态口令默认关闭 —— 有密钥也必须后台显式开启（TOTPEnabled=true）
+	// 才参与登录；nil（从来没设过）与 false 都按关算。
+	totp = totpSecretSet(c) && c.TOTPEnabled != nil && *c.TOTPEnabled
 	g := c.GitHub
 	gh = g.Enabled && g.ClientID != "" && g.ClientSecret != "" && len(g.Allow) > 0
 	return
+}
+
+// totpSecretSet 此刻有没有可用的动态口令密钥：后台生成的（状态文件，1.12.0）
+// 优先，其次环境变量 GATE_TOTP_SECRET。有密钥 ≠ 开启（还要 TOTPEnabled=true）。
+func totpSecretSet(c gateConfig) bool {
+	return strings.TrimSpace(c.TOTPSecret) != "" || needTotp
 }
 
 func loginModes() (pw, totp, gh bool) { return modesOf(configSnapshot()) }
@@ -3564,29 +3794,98 @@ func backToAdmin(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, gatePrefix+"/admin", http.StatusSeeOther)
 }
 
-// handleMethods 开关动态验证码登录。★ 校验后置：改完必须还剩至少一种登录方式，
-// 否则这一步会把门从里面锁死（GitHub 没配好又关掉动态密码 = 谁也进不来）。
+// handleMethods 后台「动态口令」操作（1.12.0 引导式配置）。step 三态：
+//   gen = 生成新密钥并强制进入未开启状态（按引导绑定，填对验证码再开）；
+//   on  = 用当前密钥验一码后开启（没密钥/码错都拒绝）；
+//   off = 关闭（仍要保证至少剩一种登录方式）。
+//
+// ★ 保留了旧实现的「校验后置」原则：off/gen 改完必须还剩至少一种登录方式，
+// 否则这一步会把门从里面锁死（GitHub 没配好又关掉动态口令 = 谁也进不来）。
+// 兼容旧表单：没有 step 时按 totp=on/off 处理（老 on 走新 on 分支，需验证码）。
 func handleMethods(w http.ResponseWriter, r *http.Request) {
 	if !adminPost(w, r) {
 		return
 	}
 	ip := clientIP(r)
+	step := r.FormValue("step")
+	if step == "" {
+		if r.FormValue("totp") == "on" {
+			step = "on"
+		} else {
+			step = "off"
+		}
+	}
 	c := configSnapshot()
-	on := r.FormValue("totp") == "on"
-	c.TOTPEnabled = &on
-	if pw, totp, gh := modesOf(c); !pw && !totp && !gh {
-		setAdminMsg("没改：这会让所有登录方式都关掉，谁也进不来。请先配好 GitHub 登录。")
-		secNote("登录方式变更", ip, "被拒：会导致没有任何登录方式")
-		backToAdmin(w, r)
-		return
+	code := r.FormValue("code")
+
+	switch step {
+	case "gen":
+		key := make([]byte, 20)
+		if _, err := rand.Read(key); err != nil {
+			setAdminMsg("没生成：系统随机数不可用：%v", err)
+			secNote("动态口令", ip, "生成密钥失败：%v", err)
+			backToAdmin(w, r)
+			return
+		}
+		c.TOTPSecret = base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(key)
+		off := false
+		c.TOTPEnabled = &off // 生成即「未开启」：绑好、验过码才开
+		// 关闭态下至少还得剩一种登录方式（否则谁也进不来）
+		if pw, totp, gh := modesOf(c); !pw && !totp && !gh {
+			setAdminMsg("没生成：生成密钥会把动态口令停用，这会让所有登录方式都没了。请先配好口令或 GitHub 登录。")
+			secNote("动态口令", ip, "生成被拒：会导致没有任何登录方式")
+			backToAdmin(w, r)
+			return
+		}
+		if err := saveConfig(c); err != nil {
+			setAdminMsg("已生成新密钥（仅内存生效，没写进磁盘，重启会丢旧配置）：%v —— 按引导绑定并开启前，先解决它。", err)
+		} else {
+			setAdminMsg("已生成新的动态口令密钥，旧密钥作废。请按下方引导绑定验证器，填一次正确验证码点「验证并开启」；绑定成功前别做别的操作。")
+		}
+		secNote("动态口令", ip, "生成新密钥（未开启，等绑定验证）")
+	case "on":
+		if !totpSecretSet(c) {
+			setAdminMsg("没开：还没有密钥，先点「生成密钥并开始引导」。")
+			secNote("动态口令", ip, "开启被拒：没有密钥")
+			backToAdmin(w, r)
+			return
+		}
+		if ct, ok := verifyTOTP(code, ip); !ok {
+			setAdminMsg("没开：动态验证码不正确（或已用过）。绑定对了的验证器给的码 30 秒一换，换一个最新的再试。")
+			secNote("动态口令", ip, "开启被拒：验证码不通过")
+			backToAdmin(w, r)
+			return
+		} else {
+			// 这个码是「绑定验证」用掉的，记账防止它再当登录码用一次
+			markTotpUsed(ct)
+		}
+		on := true
+		c.TOTPEnabled = &on
+		if err := saveConfig(c); err != nil {
+			setAdminMsg("已开启（仅内存生效，没写进磁盘）：%v", err)
+		} else {
+			setAdminMsg("动态口令已开启。下次登录变成两步：先用户名和口令，再动态验证码；不填验证码进不来。")
+		}
+		secNote("动态口令", ip, "开启（当前可用：%s）", modesSummary())
+	case "off":
+		off := false
+		c.TOTPEnabled = &off
+		if pw, totp, gh := modesOf(c); !pw && !totp && !gh {
+			setAdminMsg("没关：这会让所有登录方式都关掉，谁也进不来。请先配好 GitHub 登录。")
+			secNote("动态口令", ip, "关闭被拒：会导致没有任何登录方式")
+			backToAdmin(w, r)
+			return
+		}
+		if err := saveConfig(c); err != nil {
+			setAdminMsg("已关闭（仅内存生效，没写进磁盘）：%v", err)
+		} else {
+			setAdminMsg("动态口令已关闭。下次登录只问用户名和口令，不再要验证码；密钥还留着，想再开点「验证并开启」即可。")
+		}
+		secNote("动态口令", ip, "关闭（当前可用：%s）", modesSummary())
+	default:
+		setAdminMsg("没改：不认识的操作 %q。", step)
+		secNote("动态口令", ip, "未知操作 %q 被拒", step)
 	}
-	err := saveConfig(c)
-	if err != nil {
-		setAdminMsg("动态验证码已%s（仅内存生效，没写进磁盘）：%v", onOff(on), err)
-	} else {
-		setAdminMsg("动态验证码已%s。下次打开登录页即生效，不用重启。", onOff(on))
-	}
-	secNote("登录方式变更", ip, "动态验证码=%s（当前可用：%s）", onOff(on), modesSummary())
 	backToAdmin(w, r)
 }
 
@@ -3647,6 +3946,70 @@ func handlePassword(w http.ResponseWriter, r *http.Request) {
 		setAdminMsg("口令已修改。下次登录用新口令；已登录的设备不受影响。")
 	}
 	secNote("修改口令", ip, "口令已更换（登录方式：%s）", modesSummary())
+	backToAdmin(w, r)
+}
+
+// handleUsername 后台改登录用户名（1.12.0 需求②）。
+// 骨架与 handlePassword 一致：原口令 + 开着动态口令时的一码 = 再认证一次，
+// 才肯收新用户名。只写状态文件 username、不动会话密钥 —— 改完不踢人，
+// 正在用的登录态继续有效，下次登录起用新用户名。
+func handleUsername(w http.ResponseWriter, r *http.Request) {
+	if !adminPost(w, r) {
+		return
+	}
+	ip := clientIP(r)
+	oldName := r.FormValue("old")
+	newName := strings.TrimSpace(r.FormValue("newuser"))
+	if !needPw {
+		setAdminMsg("没改：现在没配用户名/口令登录，改不了用户名。")
+		backToAdmin(w, r)
+		return
+	}
+	// 原用户名必须对上（哈希后常量时间比，跟登录页 username 层同一套写法，
+	// 不给逐字符的时序信号）。
+	if subtle.ConstantTimeCompare([]byte(hashPassword(oldName)), []byte(hashPassword(currentUsername()))) != 1 {
+		setAdminMsg("没改：原用户名不正确。")
+		secNote("修改用户名", ip, "被拒：原用户名不正确")
+		backToAdmin(w, r)
+		return
+	}
+	if totpOn() {
+		if _, ok := verifyTOTP(r.FormValue("code"), ip); !ok {
+			setAdminMsg("没改：动态验证码不正确。")
+			secNote("修改用户名", ip, "被拒：动态验证码不正确")
+			backToAdmin(w, r)
+			return
+		}
+	}
+	if newName == "" {
+		setAdminMsg("没改：新用户名不能为空。")
+		backToAdmin(w, r)
+		return
+	}
+	if newName == oldName {
+		setAdminMsg("没改：新用户名和原用户名一样。")
+		backToAdmin(w, r)
+		return
+	}
+	if len([]rune(newName)) > 64 {
+		setAdminMsg("没改：新用户名太长（最多 64 个字符）。")
+		backToAdmin(w, r)
+		return
+	}
+	if strings.ContainsAny(newName, "\r\n\t\x00") {
+		setAdminMsg("没改：新用户名不能带换行、制表或空字符。")
+		backToAdmin(w, r)
+		return
+	}
+	c := configSnapshot()
+	c.Username = newName
+	err := saveConfig(c)
+	if err != nil {
+		setAdminMsg("用户名已改为 %q（仅内存生效，没写进磁盘）：%v", newName, err)
+	} else {
+		setAdminMsg("用户名已改为 %q。下次登录用新用户名；已登录的设备不受影响。", newName)
+	}
+	secNote("修改用户名", ip, "%q → %q（登录方式：%s）", oldName, newName, modesSummary())
 	backToAdmin(w, r)
 }
 
@@ -3818,6 +4181,10 @@ func withGate(next http.Handler) http.Handler {
 			case gatePrefix + "/password":
 				// 后台改口令（1.10.0）：验旧口令（+动态验证码）后写状态文件
 				handlePassword(w, r)
+				return
+			case gatePrefix + "/username":
+				// 后台改用户名（1.12.0）：验原用户名（+动态验证码）后写状态文件
+				handleUsername(w, r)
 				return
 			case gatePrefix + "/domains":
 				// 后台改访问域名名单（1.11.0）：门禁白名单立即生效，
@@ -4261,9 +4628,6 @@ func main() {
 	// GATE_USERNAME 必须与口令同配 —— 只写用户名没口令没有意义；
 	// 「配没配上」的校验放在 loadConfig 之后（口令可能来自状态文件），见下。
 	gateUser = strings.TrimSpace(os.Getenv("GATE_USERNAME"))
-	if gateUser != "" {
-		gateUserHash = hashPassword("u:" + gateUser)
-	}
 	// GATE_DSH_SESSION_KEY：.credentials.yaml 里 client-connection/browser-session 的
 	// 32 字节 base64url secret（可带 = padding）。配上后门禁自己签 dsh-auth-* Cookie，
 	// 登录页不再显示 DSH 令牌输入框；配错只在实际换会话时暴露（探活 401），启动不拦。
@@ -4288,9 +4652,15 @@ func main() {
 			log.Printf("⚠️ 配置文件里的口令哈希格式不对（应为 64 位 hex），忽略它、继续用 GATE_PASSWORD_HASH")
 		}
 	}
+	// 首次安装默认账号（1.12.0）：全新安装什么登录配置都没有（没口令、没用户名、
+	// 没动态口令、没 GitHub）→ 落一份 admin/admin、动态口令保持关闭，装完开箱能登；
+	// 有任何一项已配置 = 不是首次安装，绝不动。
+	if bootstrapFirstInstall() {
+		log.Print("🆕 首次安装：未检测到任何登录配置，已启用默认账号 admin / admin（动态口令默认关闭）。请登录后台立刻改掉用户名和口令。")
+	}
 	// 用户名必须配得上口令（环境变量或后台改过的都算），放在这里才能两种来源都看到。
-	if gateUser != "" && !needPw {
-		log.Fatal("门禁配置错误：GATE_USERNAME 需要同时配置 GATE_PASSWORD_HASH（用户名必须配口令）")
+	if currentUsername() != "" && !needPw {
+		log.Fatal("门禁配置错误：配了用户名（GATE_USERNAME 或后台改过）就必须配口令（GATE_PASSWORD_HASH 或后台改口令）")
 	}
 
 	// 访问域名（1.11.0）。DSH_TRUSTED_HOST 是 compose 传给 dsh --trusted-host

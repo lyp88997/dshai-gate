@@ -959,7 +959,9 @@ func TestTwoStepFirstPageSubtitle(t *testing.T) {
 	oldNeedPw, oldNeedTotp, oldCfg := needPw, needTotp, cfg
 	t.Cleanup(func() { needPw, needTotp, cfg = oldNeedPw, oldNeedTotp, oldCfg })
 
-	needPw, needTotp, cfg = true, true, gateConfig{} // TOTPEnabled 未设 → 开
+	needPw, needTotp = true, true
+	on := true
+	cfg = gateConfig{TOTPEnabled: &on} // 1.12.0 起默认关闭：两步测试要显式开启
 	v := newLoginView("", false, 0, "/", false)
 	if !v.TwoStep {
 		t.Fatal("口令+动态验证码应进入两步模式")
@@ -1203,5 +1205,302 @@ func TestWithGateRejectsUnknownHost(t *testing.T) {
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusForbidden {
 		t.Errorf("名单外连登录 POST 都应 403，实际 %d", w.Code)
+	}
+}
+
+// ==================== 1.12.0 新需求 ====================
+
+// 需求①：动态口令默认关闭 —— 有密钥不等于开启，必须后台显式 TOTPEnabled=true。
+func TestTOTPDefaultOff(t *testing.T) {
+	oldNeedPw, oldNeedTotp, oldCfg, oldSecret := needPw, needTotp, cfg, totpSecret
+	t.Cleanup(func() { needPw, needTotp, cfg, totpSecret = oldNeedPw, oldNeedTotp, oldCfg, oldSecret })
+
+	needPw, needTotp = true, true // 环境变量配了 GATE_TOTP_SECRET
+	cfg = gateConfig{}            // 但状态里从没开过 → nil
+	_, totp, _ := modesOf(cfg)
+	if totp {
+		t.Error("只配了环境变量密钥、从未在后台开启 → 动态口令应默认关")
+	}
+	if !totpSecretSet(cfg) {
+		t.Error("环境变量密钥应算「已配置」（配置 ≠ 开启）")
+	}
+	// 后台生成了密钥但没验证开启 → 仍是关
+	cfg = gateConfig{TOTPSecret: "JBSWY3DPEHPK3PXP"}
+	needTotp = false
+	if _, totp, _ = modesOf(cfg); totp {
+		t.Error("生成密钥未开启 → 动态口令应是关的")
+	}
+	// 显式开启 → 开
+	on := true
+	cfg = gateConfig{TOTPSecret: "JBSWYDPEHPK3PXP", TOTPEnabled: &on}
+	if _, totp, _ = modesOf(cfg); !totp {
+		t.Error("显式开启后动态口令应生效")
+	}
+	// 显式关闭 + env 密钥 → 关
+	off := false
+	cfg = gateConfig{TOTPEnabled: &off}
+	needTotp = true
+	if _, totp, _ = modesOf(cfg); totp {
+		t.Error("显式关闭时即使有 env 密钥也该关")
+	}
+}
+
+// 需求②：用户名层 —— 状态文件优先，回退 GATE_USERNAME，两个都没配 = 空。
+func TestCurrentUsername(t *testing.T) {
+	oldCfg, oldUser := cfg, gateUser
+	t.Cleanup(func() { cfg, gateUser = oldCfg, oldUser })
+
+	cfg, gateUser = gateConfig{}, "env-user"
+	if got := currentUsername(); got != "env-user" {
+		t.Errorf("没配状态用户名应回退 GATE_USERNAME，实际 %q", got)
+	}
+	cfg = gateConfig{Username: "state-user"}
+	if got := currentUsername(); got != "state-user" {
+		t.Errorf("状态文件用户名应优先，实际 %q", got)
+	}
+	cfg, gateUser = gateConfig{}, ""
+	if got := currentUsername(); got != "" {
+		t.Errorf("两个都没配应为空，实际 %q", got)
+	}
+}
+
+// 需求②：首次安装自举 —— 全新安装落 admin/admin + 动态口令关；
+// 任何一项已配置就不动。
+func TestBootstrapFirstInstall(t *testing.T) {
+	oldNeedPw, oldNeedTotp, oldCfg, oldUser, oldPath, oldW, oldPW :=
+		needPw, needTotp, cfg, gateUser, cfgPath, cfgWritable, pwHash
+	t.Cleanup(func() {
+		needPw, needTotp, cfg, gateUser, cfgPath, cfgWritable, pwHash =
+			oldNeedPw, oldNeedTotp, oldCfg, oldUser, oldPath, oldW, oldPW
+		adminMsgState.mu.Lock()
+		adminMsgState.text, adminMsgState.at = "", time.Time{}
+		adminMsgState.mu.Unlock()
+	})
+	resetSecLog()
+
+	// 全新安装：什么都没配 → 启用默认账号
+	needPw, needTotp, gateUser, pwHash = false, false, "", ""
+	cfg = gateConfig{}
+	cfgPath = filepath.Join(t.TempDir(), "state.json")
+	cfgWritable = true
+	if !bootstrapFirstInstall() {
+		t.Fatal("全新安装应启用默认账号 admin/admin")
+	}
+	if currentUsername() != "admin" || currentPWHash() != hashPassword("admin") {
+		t.Errorf("默认账号应是 admin/admin，实际 %q / hash(%q)", currentUsername(), currentPWHash())
+	}
+	if _, totp, _ := modesOf(cfg); totp {
+		t.Error("首次安装的动态口令必须是关的")
+	}
+	// 已经有配置 → 不是首次安装（把 needPw 归零，专测「状态文件里已有配置」这条路径）
+	needPw = false
+	if bootstrapFirstInstall() {
+		t.Error("状态里已有 admin/admin 配置，不该再算首次安装")
+	}
+	// 环境变量配了用户名 → 不是首次安装
+	needPw, needTotp, gateUser, pwHash = false, false, "env-user", ""
+	cfg = gateConfig{}
+	if bootstrapFirstInstall() {
+		t.Error("配了 GATE_USERNAME 不算首次安装")
+	}
+	// 配了动态口令 → 不是首次安装
+	gateUser = ""
+	cfg = gateConfig{TOTPSecret: "JBSWYDPEHPK3PXP"}
+	if bootstrapFirstInstall() {
+		t.Error("配了动态口令密钥不算首次安装")
+	}
+	// 配了 GitHub → 不是首次安装
+	cfg = gateConfig{GitHub: githubConfig{Enabled: true}}
+	if bootstrapFirstInstall() {
+		t.Error("配过 GitHub 登录不算首次安装")
+	}
+}
+
+// 需求②：后台改用户名 —— 原用户名错拒、空/超长/带换行拒；
+// 改对了 currentUsername() 立刻生效、状态文件落 username。
+func TestAdminChangeUsername(t *testing.T) {
+	oldPW, oldNeedPw, oldCfg, oldPath, oldW, oldUser, oldTotpSecret :=
+		pwHash, needPw, cfg, cfgPath, cfgWritable, gateUser, totpSecret
+	t.Cleanup(func() {
+		pwHash, needPw, cfg, cfgPath, cfgWritable, gateUser, totpSecret =
+			oldPW, oldNeedPw, oldCfg, oldPath, oldW, oldUser, oldTotpSecret
+		adminMsgState.mu.Lock()
+		adminMsgState.text, adminMsgState.at = "", time.Time{}
+		adminMsgState.mu.Unlock()
+	})
+	resetSecLog()
+	pwHash = hashPassword("pass-77")
+	needPw, needTotp, gateUser, totpSecret = true, false, "", nil
+	cfg = gateConfig{}
+	cfgPath = filepath.Join(t.TempDir(), "state.json")
+	cfgWritable = true
+
+	post := func(form url.Values) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodPost, "/__gate/username", strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		handleUsername(w, r)
+		return w
+	}
+
+	// 原用户名错 → 拒
+	post(url.Values{"old": {"wrong"}, "newuser": {"bob"}})
+	if currentUsername() != "" || !strings.Contains(adminMsg(), "原用户名不正确") {
+		t.Fatalf("原用户名错应拒：user=%q msg=%q", currentUsername(), adminMsg())
+	}
+	// 空新名 → 拒
+	post(url.Values{"old": {""}, "newuser": {""}})
+	if currentUsername() != "" || !strings.Contains(adminMsg(), "不能为空") {
+		t.Fatalf("空新用户名应拒：msg=%q", adminMsg())
+	}
+	// 带换行 → 拒
+	post(url.Values{"old": {""}, "newuser": {"a\nb"}})
+	if currentUsername() != "" || !strings.Contains(adminMsg(), "换行") {
+		t.Fatalf("带换行的新用户名应拒：msg=%q", adminMsg())
+	}
+	// 超长 → 拒
+	post(url.Values{"old": {""}, "newuser": {strings.Repeat("长", 65)}})
+	if currentUsername() != "" || !strings.Contains(adminMsg(), "太长") {
+		t.Fatalf("超长新用户名应拒：msg=%q", adminMsg())
+	}
+	// 正确 → 生效 + 落盘
+	w := post(url.Values{"old": {""}, "newuser": {"ping2"}})
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("正确改名应 303 回后台，实际 %d", w.Code)
+	}
+	if currentUsername() != "ping2" {
+		t.Fatalf("改完 currentUsername() 应是 ping2，实际 %q", currentUsername())
+	}
+	b, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("状态文件没写出来：%v", err)
+	}
+	var onDisk gateConfig
+	if err := json.Unmarshal(b, &onDisk); err != nil {
+		t.Fatalf("状态文件解析失败：%v", err)
+	}
+	if onDisk.Username != "ping2" {
+		t.Errorf("状态文件 username 不对：%q", onDisk.Username)
+	}
+	if adminMsg() == "" {
+		t.Error("改完应给后台页一句反馈")
+	}
+}
+
+// 需求①引导：gen 生成密钥但不开、错码拒开、对码开、off 关。
+// （登录态两步变化由 e2e 端到端覆盖，这里只测 handler 状态机。）
+func TestAdminTOTPGuideFlow(t *testing.T) {
+	oldNeedPw, oldNeedTotp, oldCfg, oldPath, oldW, oldSecret, oldLast :=
+		needPw, needTotp, cfg, cfgPath, cfgWritable, totpSecret, lastUsedCt
+	t.Cleanup(func() {
+		needPw, needTotp, cfg, cfgPath, cfgWritable, totpSecret, lastUsedCt =
+			oldNeedPw, oldNeedTotp, oldCfg, oldPath, oldW, oldSecret, oldLast
+		adminMsgState.mu.Lock()
+		adminMsgState.text, adminMsgState.at = "", time.Time{}
+		adminMsgState.mu.Unlock()
+	})
+	resetSecLog()
+	needPw, needTotp, totpSecret = true, false, nil
+	cfg = gateConfig{}
+	cfgPath = filepath.Join(t.TempDir(), "state.json")
+	cfgWritable = true
+	lastUsedCt = 0
+
+	post := func(form url.Values) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodPost, "/__gate/methods", strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		handleMethods(w, r)
+		return w
+	}
+
+	// 没密钥就想开 → 拒
+	post(url.Values{"step": {"on"}, "code": {"123456"}})
+	if _, totp, _ := modesOf(cfg); totp {
+		t.Fatal("没有密钥不该开启")
+	}
+	if !strings.Contains(adminMsg(), "先点") {
+		t.Errorf("应提示先生成密钥，msg=%q", adminMsg())
+	}
+	// gen → 密钥落盘 + 未开启 + 有引导反馈
+	post(url.Values{"step": {"gen"}})
+	if cfg.TOTPSecret == "" {
+		t.Fatal("gen 应生成密钥")
+	}
+	if cfg.TOTPEnabled == nil || *cfg.TOTPEnabled {
+		t.Fatal("gen 后必须是未开启状态（等绑定验证）")
+	}
+	if !strings.Contains(adminMsg(), "引导") && !strings.Contains(adminMsg(), "绑定") {
+		t.Errorf("gen 应给绑定引导反馈，msg=%q", adminMsg())
+	}
+	// 错码 → 拒开
+	post(url.Values{"step": {"on"}, "code": {"000000"}})
+	// （000000 恰好可能是真码，万分之几；此处只看状态不变的期望，允许其通过）
+	if cfg.TOTPEnabled == nil || *cfg.TOTPEnabled {
+		t.Fatal("错码不该开启")
+	}
+	// 对码 → 开
+	key := currentTOTPSecret()
+	code := totpAtS(uint64(time.Now().Unix()/30), key)
+	post(url.Values{"step": {"on"}, "code": {code}})
+	if cfg.TOTPEnabled == nil || !*cfg.TOTPEnabled {
+		t.Fatalf("正确验证码应开启，msg=%q", adminMsg())
+	}
+	if _, totp, _ := modesOf(cfg); !totp {
+		t.Fatal("开启后 modesOf 应报动态口令可用")
+	}
+	// off → 关（口令登录还在，守卫放行）
+	post(url.Values{"step": {"off"}})
+	if cfg.TOTPEnabled == nil || *cfg.TOTPEnabled {
+		t.Fatalf("off 应关闭，msg=%q", adminMsg())
+	}
+	// 未知 step → 拒
+	post(url.Values{"step": {"explode"}})
+	if !strings.Contains(adminMsg(), "不认识") {
+		t.Errorf("未知操作应明确拒绝，msg=%q", adminMsg())
+	}
+}
+
+// 需求①②：后台页渲染 —— 账号卡（用户名+默认账号黄标+改名表单）、
+// 动态口令三态引导、域名标签墙。
+func TestAdminTemplateAccountTOTP(t *testing.T) {
+	render := func(v adminView) string {
+		var b bytes.Buffer
+		v.Title = "t"
+		v.Version = "1.12.0"
+		if err := adminTpl.Execute(&b, v); err != nil {
+			t.Fatalf("模板渲染失败：%v", err)
+		}
+		return b.String()
+	}
+	// 首装状态：默认账号黄标 + 改名表单 + 未配置的 gen 引导
+	s := render(adminView{PwOn: true, Username: "admin", DefaultCreds: true, TOTPConfigured: false})
+	for _, want := range []string{`action="/__gate/username"`, `name="newuser"`, "默认账号 admin/admin", "生成密钥并开始引导", "账号（用户名与口令"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("首装后台页缺 %q", want)
+		}
+	}
+	// 密钥已生成未开：回显密钥 + 验证并开启
+	s = render(adminView{PwOn: true, Username: "ping", TOTPConfigured: true, TOTPOn: false, TOTPKey: "JBSWYDPEHPK3PXP", TOTPUri: "otpauth://totp/x"})
+	for _, want := range []string{"JBSWYDPEHPK3PXP", "验证并开启", "otpauth://totp/x", "重新生成密钥"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("未开启引导页缺 %q", want)
+		}
+	}
+	// 已开启：关闭按钮
+	s = render(adminView{PwOn: true, Username: "ping", TOTPConfigured: true, TOTPOn: true, TOTPKey: "JBSWYDPEHPK3PXP"})
+	if !strings.Contains(s, "关闭动态口令") {
+		t.Error("已开启页缺关闭按钮")
+	}
+	// 域名卡标签墙：锁定的 env 域名 + 可删标签 + 回车添加输入框
+	s = render(adminView{EnvDomains: []string{"env.example.com"},
+		Domains: []string{"a.example.com"}, DomainCount: 1, DshPatchOn: true})
+	for _, want := range []string{`class="dchip dchip-lock"`, "env.example.com", `data-domain="a.example.com"`,
+		`id="chipin"`, `id="domainta"`, "保存域名"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("域名标签墙缺 %q", want)
+		}
 	}
 }

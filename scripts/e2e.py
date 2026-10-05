@@ -329,7 +329,7 @@ def main():
     try:
         wait_listen()
 
-        print("== dshai-gate e2e 测试台（1.9.0/1.10.0 回归 + 1.11.0 域名设置）==")
+        print("== dshai-gate e2e 测试台（1.9.0/1.10.0 回归 + 1.11.0 域名设置 + 1.12.0 首装/账号/动态口令引导）==")
         # ---- 未登录 ----
         st, _, _ = call("GET", "/")
         check("未登录导航 → 401", st == 401, f"实际 {st}")
@@ -515,7 +515,7 @@ def main():
         # 需求② 用户名+口令+动态验证码登录、登录页撤令牌框、自动获取 DSH 会话；
         # 需求① 插件状态「获取中」与手动检测刷新；需求③ 插件管理默认折叠；
         # 需求④ DSH 版本检测 0.2.0-rc.2 + 「缓存 10 分钟」提示。
-        print("== 1.11.0 e2e 测试台（第二实例） ==", flush=True)
+        print("== 1.9.0–1.12.0 e2e 测试台（第二实例） ==", flush=True)
         gate.terminate()
         try:
             gate.wait(timeout=5)
@@ -542,6 +542,10 @@ def main():
             "DSH_TRUSTED_HOST": HOST_NAME,
             "GATE_DSH_PATCH": os.path.join(workdir, "dsh-patch.yml"),
         })
+        # 1.12.0 起动态口令默认关闭（有密钥 ≠ 开启）。本实例的两步登录断言
+        # 仍然要跑 → 在状态文件里显式开启，正好顺带验证「后台开关的持久化」。
+        with open(os.path.join(workdir, "state2.json"), "w") as f:
+            json.dump({"totpEnabled": True}, f)
         glog = open(os.path.join(workdir, "gate2.log"), "wb")
         gate = subprocess.Popen([binary], env=env, stdout=glog, stderr=subprocess.STDOUT)
         wait_listen()
@@ -749,6 +753,133 @@ def main():
                         headers={"Accept": "text/html"}, host=HOST_NAME)
         check("清空后 .env 基础域名仍放行", st == 200, f"status={st}")
 
+        # ============ 1.12.0 首次安装 + 改用户名口令 + 动态口令引导（第三实例） ============
+        print("== 1.12.0 e2e 测试台（第三实例 · 全新安装） ==", flush=True)
+        gate.terminate()
+        try:
+            gate.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            gate.kill()
+        glog.close()
+
+        GATE_PORT = free_port()
+        HIST_PATH = os.path.join(workdir, "log3.jsonl")
+        # 全 fresh：没有用户名、没有口令哈希、没有动态口令密钥、没有 DSH patch，
+        # 一切靠「首次安装默认账号」自举。GATE_DSH_SESSION_KEY 必须保留 ——
+        # 登录成功后要自动补 DSH 会话，没有它会卡在「请填写 DSH 令牌」。
+        for k in ("GATE_USERNAME", "GATE_PASSWORD_HASH", "GATE_TOTP_SECRET",
+                  "GATE_DSH_PATCH", "DSH_TRUSTED_HOST"):
+            env.pop(k, None)
+        env.update({
+            "GATE_LISTEN": f"127.0.0.1:{GATE_PORT}",
+            "GATE_SESSION_SECRET": SECRET + "-fresh",
+            "GATE_STATE": os.path.join(workdir, "state3.json"),
+            "GATE_LOG": HIST_PATH,
+            "GATE_HEALTH_INTERVAL": "0",
+        })
+        glog = open(os.path.join(workdir, "gate3.log"), "wb")
+        gate = subprocess.Popen([binary], env=env, stdout=glog, stderr=subprocess.STDOUT)
+        wait_listen()
+
+        with open(os.path.join(workdir, "gate3.log"), "rb") as fh:
+            bootlog = fh.read().decode("utf-8", "replace")
+        check("首装自举日志（默认账号 admin/admin）",
+              "首次安装" in bootlog and "admin" in bootlog, bootlog[:300])
+
+        # ---- 首装登录页：有用户名框、无验证码框（动态口令默认关闭） ----
+        st, _, body = call("GET", "/__gate/login", headers={"Accept": "text/html"})
+        page = body.decode("utf-8", "replace")
+        check("首装登录页有用户名框", 'name="username"' in page, "")
+        check("首装登录页无验证码框（默认关闭）", 'name="code"' not in page, "")
+        st, hdr, _ = call("POST", "/__gate/login",
+                          body=urlencode({"username": "admin", "password": "admin"}),
+                          headers=CT)
+        n3 = extract_cookie(hdr, "dshai_gate")
+        check("默认账号 admin/admin 登录 → 303", st == 303 and n3 is not None,
+              f"status={st}")
+
+        def admin3():
+            s, _, b = call("GET", "/__gate/admin", cookie=n3 or "",
+                           headers={"Accept": "text/html"})
+            return b.decode("utf-8", "replace")
+
+        pa = admin3()
+        check("后台挂出默认账号黄标", "默认账号 admin/admin" in pa, "")
+
+        # ---- 改用户名：原用户名校验 → 新名上屏 → 旧名失效 ----
+        st, _, body = call("POST", "/__gate/username", cookie=n3 or "",
+                           body=urlencode({"old": "admin", "newuser": "ping"}),
+                           headers=CT)
+        pa = admin3()
+        check("改用户名 → 303 + 新名上屏 + 黄标撤下",
+              st == 303 and "ping" in pa and "默认账号" not in pa, f"status={st}")
+        st, _, _ = call("POST", "/__gate/login",
+                        body=urlencode({"username": "admin", "password": "admin"}),
+                        headers=CT)
+        check("旧用户名登录 → 401", st == 401, f"status={st}")
+        st, hdr, _ = call("POST", "/__gate/login",
+                          body=urlencode({"username": "ping", "password": "admin"}),
+                          headers=CT)
+        check("新用户名登录 → 303", st == 303, f"status={st}")
+
+        # ---- 改口令：旧口令失效、新口令生效（1.10.0 回归 + 1.12.0 组合） ----
+        st, _, body = call("POST", "/__gate/password", cookie=n3 or "",
+                           body=urlencode({"old": "admin", "new": "newpass.1",
+                                           "confirm": "newpass.1"}),
+                           headers=CT)
+        pa = admin3()
+        check("改口令 → 303 且横幅确认", st == 303 and "口令已修改" in pa,
+              f"status={st}")
+        st, _, _ = call("POST", "/__gate/login",
+                        body=urlencode({"username": "ping", "password": "admin"}),
+                        headers=CT)
+        check("旧口令登录 → 401", st == 401, f"status={st}")
+        st, _, _ = call("POST", "/__gate/login",
+                        body=urlencode({"username": "ping", "password": "newpass.1"}),
+                        headers=CT)
+        check("新口令登录 → 303", st == 303, f"status={st}")
+
+        # ---- 动态口令引导（1.12.0 需求③）：生成密钥 → 绑定码验证 → 开启 ----
+        pa = admin3()
+        check("动态口令默认未配置（引导四步 + 生成按钮）",
+              "未配置" in pa and "生成密钥并开始引导" in pa, "")
+        st, _, _ = call("POST", "/__gate/methods", cookie=n3 or "",
+                        body=urlencode({"step": "gen"}), headers=CT)
+        pa = admin3()
+        check("生成密钥 → 横幅 + 密钥/验证框展开",
+              st == 303 and "已生成新的动态口令密钥" in pa
+              and "验证并开启" in pa and "密钥已生成，未开启" in pa,
+              f"status={st}")
+        with open(os.path.join(workdir, "state3.json")) as fh:
+            key3 = json.load(fh).get("totpSecret", "")
+        check("新密钥落盘 state.json", len(key3) >= 16, key3)
+        st, _, _ = call("POST", "/__gate/methods", cookie=n3 or "",
+                        body=urlencode({"step": "on", "code": totp_now(key3)}),
+                        headers=CT)
+        pa = admin3()
+        check("验证码通过 → 动态口令已开启",
+              st == 303 and "动态口令已开启" in pa and "两步" in pa, f"status={st}")
+        with open(os.path.join(workdir, "state3.json")) as fh:
+            st3 = json.load(fh)
+        check("开启状态落盘 totpEnabled=true", st3.get("totpEnabled") is True, str(st3))
+
+        # ---- 开启后：登录真的变两步 ----
+        f1 = urlencode({"username": "ping", "password": "newpass.1"})
+        st, _, body = call("POST", "/__gate/login", body=f1, headers=CT)
+        page = body.decode("utf-8", "replace")
+        check("开启后第 1 步出验证码栏（两步生效）",
+              st == 200 and 'name="st"' in page and 'name="code"' in page,
+              f"status={st} {page[:120]}")
+        if 'name="st" value="' in page:
+            tok = page.split('name="st" value="', 1)[1].split('"', 1)[0]
+            # 开启时用掉过一个码（防重放）→ 登录拿下一时间片的码
+            f2 = urlencode({"username": "ping", "password": "newpass.1",
+                            "code": totp_now(key3, 1), "st": tok})
+            st, hdr, _ = call("POST", "/__gate/login", body=f2, headers=CT)
+            check("两步验证码正确 → 303 进入", st == 303, f"status={st}")
+        else:
+            check("两步验证码正确 → 303 进入", False, "第 1 步没出票据")
+
     finally:
         gate.terminate()
         try:
@@ -765,7 +896,7 @@ def main():
     total = len(results)
     print(f"\n结果：{passed}/{total} 通过", flush=True)
     if passed != total:
-        for lg in ("gate.log", "gate2.log"):
+        for lg in ("gate.log", "gate2.log", "gate3.log"):
             print(f"—— {lg} 尾部 ——", flush=True)
             try:
                 with open(os.path.join(workdir, lg), "rb") as f:
