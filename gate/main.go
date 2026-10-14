@@ -59,7 +59,7 @@ const injection = `<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__D
 
 const (
 	gatePrefix   = "/__gate"
-	gateVersion  = "1.12.0"
+	gateVersion  = "1.13.2"
 	cookieName   = "dshai_gate"
 	pwSalt       = "dshai-gate-v1"
 
@@ -1068,14 +1068,14 @@ func dshAuthority(host string) string {
 // dshAutoSign 用 GATE_DSH_SESSION_KEY 自签一枚 DSH 会话 Cookie（需求②自动获取）：
 // v1.<base64url(JSON)>.<base64url(HMAC-SHA256)>，HMAC 只覆盖 body 段，
 // 与 dsh-client-connection 的 BrowserAuth 完全同构（算法已在探针上验证可签可验）。
-func dshAutoSign(r *http.Request) (*http.Cookie, error) {
+func dshAutoSign(host string) (*http.Cookie, error) {
 	if len(dshAutoKey) != 32 {
 		return nil, fmt.Errorf("GATE_DSH_SESSION_KEY 未配置")
 	}
 	if upstreamURL == nil {
 		return nil, fmt.Errorf("上游未就绪")
 	}
-	authority := dshAuthority(r.Host)
+	authority := dshAuthority(host)
 	if authority == "" {
 		return nil, fmt.Errorf("Host 为空")
 	}
@@ -1102,6 +1102,35 @@ func dshAutoSign(r *http.Request) (*http.Cookie, error) {
 		Expires:  time.Now().Add(time.Duration(days) * 24 * time.Hour),
 		HttpOnly: true, SameSite: http.SameSiteStrictMode,
 	}, nil
+}
+
+// dshSignedCookie 把自签会话压成 "名=值" 字符串；未配置 GATE_DSH_SESSION_KEY 时返回空串。
+// 1.13.2：给「改成回环身份再转发」的那条路用——身份换了，凭据也必须换成绑回环的那枚。
+func dshSignedCookie(host string) string {
+	if c, err := dshAutoSign(host); err == nil {
+		return c.Name + "=" + c.Value
+	}
+	return ""
+}
+
+// swapDSHCookie 换掉 Cookie 头里所有 dsh-auth-* 段，换成绑 authority 的自签会话。
+// 必须先剔除旧的：DSH 只取第一个同名 Cookie，留着浏览器那枚（绑公网域名）会先命中 → 401。
+// 自签不可用（没配密钥）时原样返回，保持老行为。
+func swapDSHCookie(raw, authority string) string {
+	signed := dshSignedCookie(authority)
+	if signed == "" {
+		return raw
+	}
+	out := make([]string, 0, 4)
+	for _, part := range strings.Split(raw, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.HasPrefix(part, "dsh-auth-") {
+			continue
+		}
+		out = append(out, part)
+	}
+	out = append(out, signed)
+	return strings.Join(out, "; ")
 }
 
 // ---------- 登录页 ----------
@@ -1298,7 +1327,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			// 需求②：自动获取（GitHub-only 模式下同样能自己签出会话）
-			if c, err := dshAutoSign(r); err == nil {
+			if c, err := dshAutoSign(r.Host); err == nil {
 				if !dshAcceptsCookie(r, c) {
 					secNote("自动获取失败", ip, "自签的会话 Cookie 不被 DSH 接受（GATE_DSH_SESSION_KEY 与 DSH 不匹配？）")
 					fail("自动获取 DSH 会话失败（GATE_DSH_SESSION_KEY 配置不匹配）")
@@ -1377,7 +1406,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimSpace(r.FormValue("dstoken"))
 	if token == "" {
 		if !hasSession {
-			if c, err := dshAutoSign(r); err == nil {
+			if c, err := dshAutoSign(r.Host); err == nil {
 				if !dshAcceptsCookie(r, c) {
 					secNote("自动获取失败", ip, "自签的会话 Cookie 不被 DSH 接受（GATE_DSH_SESSION_KEY 与 DSH 不匹配？）")
 					fail("自动获取 DSH 会话失败（GATE_DSH_SESSION_KEY 配置不匹配）")
@@ -2263,6 +2292,11 @@ func restartDSH() (int, string) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://"+u.Host)
+	// 1.13.2 核心修复：身份是回环，凭据也必须是绑回环的那枚。只带浏览器那枚（绑公网域名）
+	// 在 DSH 的会话校验里必然 401（后台页看到的「需要先登录 DSH」就是它）。
+	if ck := dshSignedCookie(u.Host); ck != "" {
+		req.Header.Set("Cookie", ck)
+	}
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -2467,11 +2501,16 @@ func validInstallURL(s string) bool {
 	return err == nil && u.Scheme == "https" && u.Host != "" && u.User == nil
 }
 
-// marketPOST 以「回环直连」身份调市场的写路由：Host/Origin 取上游回环地址、
-// 不设任何 X-Forwarded-*（同 restartDSH 的理由），并原样带上浏览器的 Cookie ——
-// 市场当前不查会话，带上只是让请求与「用户亲手在市场页点按钮」更接近。
+// marketPOST 调市场的写路由：身份与浏览器一字不差（Host/Origin 取 r.Host、
+// Cookie 取 dshCookieFor(r)），不设任何 X-Forwarded-*（同 restartDSH 的理由）。
 // 超时给 300 秒：安装是长任务，但反正没人同步等它（见 marketOpState）。
-func marketPOST(path string, body any, cookie string) (int, string) {
+//
+// ★ 曾经这里用「回环直连」身份（Host 取上游回环地址）+ 浏览器 Cookie：
+//   DSH 的会话 Cookie 按 authority 绑名，那组合必然 401（2026-10-13 实测），
+//   后台页的安装/更新/启停按钮因此全部失败。市场 1.66 起也认声明过的域名
+//   （同一次实测：域名 Host + 同名 Cookie = 400「plugin is not installed」，
+//   说明已穿过市场的同源围栏），所以照浏览器原样转发是唯一通吃的身份。
+func marketPOST(path string, body any, host, cookie string) (int, string) {
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return 0, err.Error()
@@ -2483,7 +2522,12 @@ func marketPOST(path string, body any, cookie string) (int, string) {
 		return 0, err.Error()
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", "http://"+u.Host)
+	origin := u.Host
+	if host != "" {
+		req.Host = host
+		origin = host
+	}
+	req.Header.Set("Origin", "http://"+origin)
 	if cookie != "" {
 		req.Header.Set("Cookie", cookie)
 	}
@@ -2533,7 +2577,7 @@ func handleMarket(w http.ResponseWriter, r *http.Request) {
 		// 用户点一下就立刻看到新结果，不等后台轮询。
 		marketInvalidate()
 		dshVerInvalidate()
-		marketRefreshNow()
+		marketRefreshNow(r.Host, dshCookieFor(r))
 		dshVersionRefreshNow(r.Host, dshCookieFor(r))
 		secNote("插件操作", ip, "手动检测刷新")
 		setAdminMsg("已重新检测：插件列表、更新情况和 DSH 版本都取了最新。")
@@ -2599,11 +2643,12 @@ func handleMarket(w http.ResponseWriter, r *http.Request) {
 	marketOpState.at = time.Now().Format("01-02 15:04:05")
 	marketOpState.result = "进行中…"
 	cookie := r.Header.Get("Cookie")
+	host := r.Host
 	marketOpState.mu.Unlock()
 
 	secNote("插件操作", ip, "发起%s：%s", label, name)
 	go func() {
-		code, detail := marketPOST("/dsh-market/"+op, body, cookie)
+		code, detail := marketPOST("/dsh-market/"+op, body, host, cookie)
 		out := marketResultText(code, detail)
 		marketOpState.mu.Lock()
 		marketOpState.running = false
@@ -2617,9 +2662,16 @@ func handleMarket(w http.ResponseWriter, r *http.Request) {
 
 // ---------- 只读市场信息（30 秒缓存） ----------
 
-// dshGetJSON 给上游发一次只读 GET 并解 JSON。Host 取上游回环地址
-// （http.NewRequest 默认就用 URL 里的 Host），与经反代转发时的身份一致。
-func dshGetJSON(path string, timeout time.Duration, out any) error {
+// dshGetJSON 给上游发一次只读 GET 并解 JSON。
+//
+// host/cookie 必须与「浏览器打进 DSH 时的那一对」一致（host 传 r.Host、
+// cookie 传 dshCookieFor(r)）：DSH 的会话 Cookie 按 authority 绑名
+// （dsh-auth-<sha256(authority)>，见 dshAuthority），Host 与 Cookie 不配套
+// 就是 401。曾经用「回环直连」身份（Host 取上游回环地址、不带 Cookie）在
+// dshmarket 1.66 起不再免检——市场把 DSH 的 requestRejection 接到了自己的
+// 路由上，这就是后台页「插件市场拉取失败」的根因（2026-10-13 实测：
+// 回环 Host + 无 Cookie = 401，回环 Host + 回环绑名 Cookie = 200）。
+func dshGetJSON(path string, timeout time.Duration, host, cookie string, out any) error {
 	if upstreamURL == nil {
 		return fmt.Errorf("上游未配置")
 	}
@@ -2628,6 +2680,12 @@ func dshGetJSON(path string, timeout time.Duration, out any) error {
 	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
 		return err
+	}
+	if host != "" {
+		req.Host = host
+	}
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
 	}
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
@@ -2674,7 +2732,7 @@ func marketInvalidate() {
 // marketReadSnapshot 返回缓存的市场只读信息；过期时**不阻塞页面**：先回旧值
 // （没有旧值就回空值 + fetching），再后台单飞重拉——后台页永远不该因为市场
 // 慢而整页转圈。下一次渲染（页面 2 秒自动刷新或点手动检测）自然拿到新值。
-func marketReadSnapshot() marketReadInfo {
+func marketReadSnapshot(host, cookie string) marketReadInfo {
 	marketRead.mu.Lock()
 	stale := !marketRead.info.ok || time.Since(marketRead.info.at) > marketReadTTL
 	info := marketRead.info
@@ -2683,7 +2741,7 @@ func marketReadSnapshot() marketReadInfo {
 		if !marketRead.fetching {
 			marketRead.fetching = true
 			go func() {
-				ni := refreshMarketRead()
+				ni := refreshMarketRead(host, cookie)
 				marketRead.mu.Lock()
 				marketRead.info = ni
 				marketRead.fetching = false
@@ -2697,7 +2755,7 @@ func marketReadSnapshot() marketReadInfo {
 
 // marketRefreshNow 同步重拉一次（「手动检测刷新」按钮用）：用户点了按钮就在这
 // 一次请求里等结果，回页立刻是新的；与后台单飞互斥，别人在拉就直接返回。
-func marketRefreshNow() {
+func marketRefreshNow(host, cookie string) {
 	marketRead.mu.Lock()
 	if marketRead.fetching {
 		marketRead.mu.Unlock()
@@ -2705,7 +2763,7 @@ func marketRefreshNow() {
 	}
 	marketRead.fetching = true
 	marketRead.mu.Unlock()
-	ni := refreshMarketRead()
+	ni := refreshMarketRead(host, cookie)
 	marketRead.mu.Lock()
 	marketRead.info = ni
 	marketRead.fetching = false
@@ -2738,7 +2796,7 @@ type mktSnaps struct {
 
 // refreshMarketRead 四路并发拉取（status / 更新摘要 / 已装列表 / 快照），
 // 各自记各自的错：某一路挂了不至于让其它三路的数据显示不出来。
-func refreshMarketRead() marketReadInfo {
+func refreshMarketRead(host, cookie string) marketReadInfo {
 	var (
 		wg                                  sync.WaitGroup
 		st                                  mktStatus
@@ -2749,7 +2807,7 @@ func refreshMarketRead() marketReadInfo {
 	)
 	fetch := func(dst any, path string, errDst *error) {
 		defer wg.Done()
-		*errDst = dshGetJSON(path, 5*time.Second, dst)
+		*errDst = dshGetJSON(path, 5*time.Second, host, cookie, dst)
 	}
 	wg.Add(4)
 	go fetch(&st, "/dsh-market/status", &errVer)
@@ -2811,7 +2869,7 @@ var marketStatusCache struct {
 	err string
 }
 
-func marketStatusNow() (mktStatus, string) {
+func marketStatusNow(host, cookie string) (mktStatus, string) {
 	marketStatusCache.mu.Lock()
 	if !marketStatusCache.at.IsZero() && time.Since(marketStatusCache.at) < marketStatusTTL {
 		st, err := marketStatusCache.st, marketStatusCache.err
@@ -2821,7 +2879,7 @@ func marketStatusNow() (mktStatus, string) {
 	marketStatusCache.mu.Unlock()
 	var st mktStatus
 	errStr := ""
-	if err := dshGetJSON("/dsh-market/status", 3*time.Second, &st); err != nil {
+	if err := dshGetJSON("/dsh-market/status", 3*time.Second, host, cookie, &st); err != nil {
 		errStr = err.Error()
 	}
 	marketStatusCache.mu.Lock()
@@ -2855,7 +2913,7 @@ var dshVerRead struct {
 // dshCookieFor 给版本检测用的 Cookie：优先门禁自签（不依赖浏览器状态，
 // GATE_DSH_SESSION_KEY 配了就够），没配就借浏览器带来的整串 Cookie。
 func dshCookieFor(r *http.Request) string {
-	if c, err := dshAutoSign(r); err == nil {
+	if c, err := dshAutoSign(r.Host); err == nil {
 		return c.Name + "=" + c.Value
 	}
 	return r.Header.Get("Cookie")
@@ -2988,10 +3046,10 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	// 体检数据：市场只读信息走 30 秒缓存、进度走 5 秒缓存，都是给完超时就认输
 	// （写「拉取失败」照常出页）—— 体检卡绝不能把整张后台页拖死。
-	mkt := marketReadSnapshot()
+	mkt := marketReadSnapshot(r.Host, dshCookieFor(r))
 	// DSH 版本：缓存 10 分钟、过期后台单飞重检，页面只读缓存（1.9.0）。
 	dshVer, dshVerFetching := dshVersionSnapshot(r.Host, dshCookieFor(r))
-	st, stErr := marketStatusNow()
+	st, stErr := marketStatusNow(r.Host, dshCookieFor(r))
 	opRunning, op, opAt, opResult := marketOpSnapshot()
 	histQuery := r.URL.Query().Get("q")
 	hist := histReadRows(histQuery)
@@ -3739,7 +3797,7 @@ func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 	setCookie(w, r, cookieName, val, maxAge)
 	if dshHasSession(r) {
 		stampDSHSession(w, r)
-	} else if c, err := dshAutoSign(r); err == nil && dshAcceptsCookie(r, c) {
+	} else if c, err := dshAutoSign(r.Host); err == nil && dshAcceptsCookie(r, c) {
 		// 需求②：GitHub 登录成功后本机没有 DSH 会话时，门禁直接自签一枚
 		http.SetCookie(w, c)
 		stampDSHSession(w, r)
@@ -4489,19 +4547,30 @@ func newProxy(target *url.URL, inject bool) *httputil.ReverseProxy {
 			// ★ 关键：SetURL 会把 Host 改成上游地址，必须改回原域名，
 			//   否则 DSH 的 --trusted-host 校验失败，特权接口全部 403
 			pr.Out.Host = pr.In.Host
-			// ★ 仅回环类接口 + 市场变更路由（见 marketMutationPaths）+ 重启路由：
-			//   向上游呈现回环身份（Host + Origin 同步），
-			//   否则插件自身的 loopback-only 围栏会拒绝经反代来的合法请求。
+			// ★ 只给回环类接口 + 重启路由呈现回环身份（Host 与 Origin 同步）：这两类
+			//   路由各自的围栏只认回环。
+			//   ⚠️ 市场变更路由（marketMutationPaths）**千万不能**算进来（2026-10-13 实测修复）：
+			//   市场每个路由都先过宿主 requestGate，其中 isAuthenticated 按 Host 的 authority
+			//   去找 dsh-auth-<hash(authority)> Cookie。经门禁来的浏览器 Cookie 属公网
+			//   authority（如 ai.mzlp.eu.org），Host 一旦改成 127.0.0.1:3082 就永远找不到
+			//   那枚 Cookie → 一律 401「需要先登录 DSH」，安装/更新/启停点了没反应。
+			//   市场 1.56+ 的 sameOrigin 已接受 --trusted-host 声明的 authority（实测 18 条
+			//   变更路由带公网身份全部放行），所以这些路径保持原 Host 即可。
+
 			//   其余路径一律保持原 Host，避免影响 DSH 的 Cookie 归属与信任校验。
 			//   含 "." / ".." 段的路径不给身份：它会与上游归一化后的落地路径不一致，
 			//   等于给白名单开后门（见 hasDotSegment 注释）。
 			// path 取一次：回环身份判定与转发头擦除共用。
 			path := pr.In.URL.Path
-			if (loopbackOnlyPath(path) || marketMutationPath(path) || processControlPath(path)) && !hasDotSegment(path) {
+			if (loopbackOnlyPath(path) || processControlPath(path)) && !hasDotSegment(path) {
 				pr.Out.Host = target.Host
 				if pr.In.Header.Get("Origin") != "" {
 					pr.Out.Header.Set("Origin", "http://"+target.Host)
 				}
+				// 1.13.2 核心修复：Host 换成回环后，浏览器那枚绑公网域名的 dsh-auth-* 找不到了，
+				// 市场/重启类路由一律 401。换成门禁自签的回环会话（没配密钥则原样不动）。
+				// 有了这一句，将来把 marketMutationPath 重新算进回环身份也不会再踩 401。
+				pr.Out.Header.Set("Cookie", swapDSHCookie(pr.In.Header.Get("Cookie"), target.Host))
 			}
 			pr.SetXForwarded()
 			// ★ 市场重启路由：擦掉转发痕迹。市场自己那道「无转发头 = 本机直连」

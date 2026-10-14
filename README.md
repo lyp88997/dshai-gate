@@ -392,7 +392,7 @@ DSH 启动时会打印一个一次性配对链接（`http://127.0.0.1:3082/?toke
 | `GATE_TOTP_SECRET` | — | Base32 的 TOTP 密钥（可含空格、大小写不敏感）。**1.12.0 起：配了它 ≠ 开启**——动态口令默认关闭，要到后台「动态口令」卡点「验证并开启」才对外生效；后台生成的密钥（状态文件 `totpSecret`）优先于本项 |
 | `GATE_SESSION_SECRET` | — | 会话签名密钥，至少 16 字节 |
 | `GATE_USERNAME` | — | **登录用户名（1.9.0）**：配了登录页就多一个用户名框（三要素）。**必须与 `GATE_PASSWORD_HASH` 同时配**，否则拒绝启动；留空 = 不要用户名框。**1.12.0 起后台「账号」卡可改用户名**（状态文件 `username` 优先于本项），首次安装则默认 admin |
-| `GATE_DSH_SESSION_KEY` | — | **DSH 会话自动获取（1.9.0）**：DSH `.credentials.yaml` 里 `client-connection/browser-session` 的 32 字节 secret（base64url，43 字符）。配上后登录页不再显示「DSH 令牌」框、登录时门禁自签会话 Cookie（与 DSH 不匹配会明确报错）；留空 = 保持旧行为 |
+| `GATE_DSH_SESSION_KEY` | — | **DSH 会话自动获取（1.9.0）**：DSH `.credentials.yaml` 里 `client-connection/browser-session` 的 32 字节 secret（base64url，43 字符）。配上后登录页不再显示「DSH 令牌」框、登录时门禁自签会话 Cookie（与 DSH 不匹配会明确报错）；留空 = 保持旧行为。**1.13.2 起同一把密钥还给「改成回环身份再转发」的内部请求签回环会话**——否则 dshmarket 1.66+ 套在市场/重启路由上的宿主门禁按 Host 算会话归属，浏览器那枚绑域名、上游一律回 401「需要先登录 DSH」 |
 | `GATE_DSH_PATCH` | — | **DSH 白名单同步（1.11.0）**：DSH `--patch` 文件的路径（compose 里 = `/data/dsh-patch.yml` = 宿主 `gate-data/dsh-patch.yml`，dsh 以只读卷挂为 `/gate-patch/dsh-patch.yml`）。配了它，后台改域名就自动重写这份文件；留空 = 不同步（门禁自己的 Host 白名单照常工作） |
 | `TZ` | `Asia/Shanghai`（compose 默认） | 日志与后台页时间用的时区。本服务镜像基于 alpine、**没有 zoneinfo**，时区库是编译进二进制的（`_ "time/tzdata"`），所以独立二进制也生效；不设则退回 UTC |
 

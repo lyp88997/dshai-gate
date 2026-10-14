@@ -584,7 +584,7 @@ func TestDshAutoSignShape(t *testing.T) {
 	upstreamURL = u
 	r, _ := http.NewRequest(http.MethodGet, "http://harness.mzlp.eu.org/", nil)
 	r.Host = "Harness.mzlp.eu.org"
-	c, err := dshAutoSign(r)
+	c, err := dshAutoSign(r.Host)
 	if err != nil {
 		t.Fatalf("dshAutoSign 失败：%v", err)
 	}
@@ -665,7 +665,7 @@ func TestMarketReadSnapshotDoesNotBlock(t *testing.T) {
 		marketRead.mu.Unlock()
 	})
 	start := time.Now()
-	info := marketReadSnapshot()
+	info := marketReadSnapshot("", "")
 	elapsed := time.Since(start)
 	if elapsed > 2*time.Second {
 		t.Fatalf("快照被市场拉取阻塞了 %v（必须立刻返回旧值）", elapsed)
@@ -1502,5 +1502,81 @@ func TestAdminTemplateAccountTOTP(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Errorf("域名标签墙缺 %q", want)
 		}
+	}
+}
+
+// ---- 1.13.2：把「改成回环身份再转发」的凭据一并换签 ----
+// 盯住 2026-10-14 生产 401 的根因：门禁把上游 Host 换成回环身份后，Cookie 头里必须
+// 只剩「签给回环 authority 的那一枚」—— 浏览器那枚绑公网域名，DSH 按 Host 算名字，
+// 一对就错位，dshmarket 1.66+ 套在每个市场路由上的宿主门禁(#603)直接回 401。
+// 判据取自 dsh-client-connection/lib/index.js 的 BrowserAuth。
+func TestSwapDSHCookie(t *testing.T) {
+	oldKey, oldUp, oldDays := dshAutoKey, upstreamURL, dshSessionDs
+	t.Cleanup(func() { dshAutoKey, upstreamURL, dshSessionDs = oldKey, oldUp, oldDays })
+	dshAutoKey = make([]byte, 32)
+	for i := range dshAutoKey {
+		dshAutoKey[i] = byte(i)
+	}
+	dshSessionDs = 30
+	u, err := url.Parse("http://127.0.0.1:3082")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamURL = u
+
+	// 期望的回环 Cookie 名：dsh-auth-<base64url(sha256(回环 authority))>
+	sum := sha256.Sum256([]byte("127.0.0.1:3082"))
+	wantName := "dsh-auth-" + base64.RawURLEncoding.EncodeToString(sum[:])
+
+	cases := []struct{ name, header, kept string }{
+		{"空 Cookie 头：只放新凭据", "", ""},
+		{"门禁自家 Cookie 原样保留", "dshai_gate=abc", "dshai_gate=abc"},
+		{"浏览器那枚 dsh-auth 被整枚换掉", "dsh-auth-ZG9tYWlu=v1.old.sig", ""},
+		{"只动 dsh-auth，别的都留", "a=1; dsh-auth-x=v1.o.s; b=2", "a=1; b=2"},
+		{"多余空白与空段不残留", " a=1 ;; ", "a=1"},
+	}
+	for _, c := range cases {
+		got := swapDSHCookie(c.header, "127.0.0.1:3082")
+		if n := strings.Count(got, "dsh-auth-"); n != 1 {
+			t.Errorf("%s：dsh-auth-* 应恰好一枚，实得 %d 枚（%q）", c.name, n, got)
+		}
+		if !strings.HasPrefix(got, c.kept) || !strings.Contains(got, wantName+"=v1.") {
+			t.Errorf("%s：应保留 %q 并追加回环凭据，实得 %q", c.name, c.kept, got)
+		}
+		if strings.Contains(got, "v1.old.sig") || strings.Contains(got, "v1.o.s") {
+			t.Errorf("%s：旧凭据没被摘掉（%q）", c.name, got)
+		}
+	}
+}
+
+func TestSwapDSHCookieWithoutKey(t *testing.T) {
+	oldKey, oldUp := dshAutoKey, upstreamURL
+	t.Cleanup(func() { dshAutoKey, upstreamURL = oldKey, oldUp })
+	dshAutoKey, upstreamURL = nil, &url.URL{Scheme: "http", Host: "127.0.0.1:3082"}
+	if got := swapDSHCookie("dshai_gate=abc", "127.0.0.1:3082"); got != "dshai_gate=abc" {
+		t.Errorf("没配密钥时应原样返回，实得 %q（应保持老行为、由上游回 401）", got)
+	}
+}
+
+func TestDSHSignedCookieLoopback(t *testing.T) {
+	oldKey, oldUp, oldDays := dshAutoKey, upstreamURL, dshSessionDs
+	t.Cleanup(func() { dshAutoKey, upstreamURL, dshSessionDs = oldKey, oldUp, oldDays })
+	dshAutoKey = make([]byte, 32)
+	for i := range dshAutoKey {
+		dshAutoKey[i] = byte(i)
+	}
+	dshSessionDs = 30
+	u, err := url.Parse("http://127.0.0.1:3082")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamURL = u
+	ck := dshSignedCookie("127.0.0.1:3082")
+	if !strings.HasPrefix(ck, "dsh-auth-") || !strings.Contains(ck, "=v1.") {
+		t.Errorf("回环凭据签不出来：%q", ck)
+	}
+	dshAutoKey = nil
+	if ck := dshSignedCookie("127.0.0.1:3082"); ck != "" {
+		t.Errorf("没配密钥却签出了凭据：%q（应返回空、保持老行为）", ck)
 	}
 }
